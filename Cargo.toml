@@ -1,0 +1,49 @@
+[package]
+name = "autoraise-rs"
+version = "1.0.0"
+edition = "2021"
+description = "Focus-follows-mouse & auto-raise for macOS, written in Rust"
+authors = ["you"]
+license = "MIT"
+
+[[bin]]
+name = "autoraise-rs"
+path = "src/main.rs"
+
+[dependencies]
+# macOS low-level bindings
+core-foundation = "0.9"
+core-graphics = { version = "0.23", features = ["highsierra"] }
+objc = "0.2"
+objc-foundation = "0.1"
+objc_id = "0.1"
+
+# Config & CLI
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+
+# Regex for ignoreTitles
+regex = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Config path resolution (~/.config/...)
+dirs-next = "2"
+
+# C bindings
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Explicit link to macOS frameworks — handled via build.rs
+
+[build-dependencies]
+# nothing needed; frameworks linked via #[link] in code
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
