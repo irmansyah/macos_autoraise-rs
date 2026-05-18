@@ -132,7 +132,7 @@ pub fn install_event_tap(sender: mpsc::SyncSender<MouseEvent>) {
         let rl = CFRunLoop::get_current();
         let mode = unsafe { kCFRunLoopDefaultMode };
         CFRunLoop::add_source(&rl, unsafe {
-            core_foundation::runloop::CFRunLoopSource::wrap_under_create_rule(
+            &core_foundation::runloop::CFRunLoopSource::wrap_under_create_rule(
                 source as *mut _
             )
         }, mode);
