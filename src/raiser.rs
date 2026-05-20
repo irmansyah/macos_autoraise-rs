@@ -42,7 +42,6 @@ const kCGEventFlagMaskControl:   u64 = 0x0004_0000;
 
 use dispatch::Queue;
 use objc::runtime::{Class, Object};
-use objc::{msg_send, sel, sel_impl};
 
 // ── CGWindow dict keys ────────────────────────────────────────────────────────
 
@@ -141,8 +140,9 @@ impl Raiser {
                 // ── Workspace Change Handler ──
                 if CONTEXT_CHANGED.swap(false, AOrdering::Relaxed) {
                     debug!("context changed — hiding border, resetting raise state");
-                    state.raised_pid      = None;
-                    state.last_window_pid = None;
+                    state.raised_window_id = None;
+                    state.last_window_id   = None;
+                    state.still_ticks      = 0;
                     
                     let cfg_c = state.config.lock().unwrap().clone();
                     if cfg_c.show_border {
@@ -187,11 +187,11 @@ impl Raiser {
 struct RaiserState {
     config: Arc<Mutex<Config>>,
     aerospace: Option<AeroSpaceState>,
-    last_window_pid: Option<i32>,
+    last_window_id: Option<u32>,
     still_ticks: u32,
     last_x: f64,
     last_y: f64,
-    raised_pid: Option<i32>,
+    raised_window_id: Option<u32>,
     aerospace_cycle_counter: u32,
     aerospace_refresh_cycles: u32,
 }
@@ -211,11 +211,11 @@ impl RaiserState {
         Self {
             config,
             aerospace,
-            last_window_pid: None,
+            last_window_id: None,
             still_ticks: 0,
             last_x: -9999.0,
             last_y: -9999.0,
-            raised_pid: None,
+            raised_window_id: None,
             aerospace_cycle_counter: 0,
             aerospace_refresh_cycles: aerospace_cycles,
         }
@@ -245,8 +245,8 @@ impl RaiserState {
         let win = match window_at_point(x, y) {
             Some(w) => w,
             None => {
-                self.last_window_pid = None;
-                self.raised_pid = None;
+                self.last_window_id = None;
+                self.raised_window_id = None;
                 self.still_ticks = 0;
                 if cfg.show_border {
                     Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
@@ -283,8 +283,8 @@ impl RaiserState {
                         debug!("  → floating: no raise, draw border only (bounds={:?})", win.bounds);
                         pin_floating_on_top(win.pid);
 
-                        let new_float = self.last_window_pid != Some(win.pid);
-                        self.last_window_pid = Some(win.pid);
+                        let new_float = self.last_window_id != Some(win.window_id);
+                        self.last_window_id = Some(win.window_id);
 
                         if new_float && cfg.show_border {
                             let bounds = win.bounds;
@@ -303,35 +303,38 @@ impl RaiserState {
             }
         }
 
-        let new_window = self.last_window_pid != Some(win.pid);
+        // Detect window change
+        let new_window = self.last_window_id != Some(win.window_id);
         if new_window {
+            debug!("  → new window instance detected, resetting state");
             self.still_ticks = 0;
-            self.raised_pid  = None;
+            self.raised_window_id = None;
         }
-        self.last_window_pid = Some(win.pid);
+        self.last_window_id = Some(win.window_id);
 
         if moved { self.still_ticks = 0; } else { self.still_ticks += 1; }
 
-        if self.raised_pid == Some(win.pid) { return; }
+        // Already raised this specific window?
+        if self.raised_window_id == Some(win.window_id) { return; }
 
+        // Delay gate
         let delay = cfg.delay;
         if delay == 0 { return; }
         if delay > 1 && cfg.require_mouse_stop && self.still_ticks < delay {
             return;
         }
 
-        // ── Raise Tiled Window + Enforce Floating Layer ──
-        debug!("  → RAISING '{}' pid={}", win.app_name, win.pid);
-        self.raised_pid = Some(win.pid);
-
-        let bounds      = win.bounds;
-        let show_border = cfg.show_border;
-        let bwidth      = cfg.border_width;
-        let bcolor      = cfg.border_color.clone();
+        // Raise specific window instance
+        debug!("  → RAISING Window {} of '{}' pid={}", win.window_id, win.app_name, win.pid);
+        self.raised_window_id = Some(win.window_id);
         
+        let bounds = win.bounds;
+        let show_border = cfg.show_border;
+        let bwidth = cfg.border_width;
+        let bcolor = cfg.border_color.clone();
         let floating_ax_ids = self.aerospace.as_ref().map(|s| s.floating_window_ids.clone()).unwrap_or_default();
 
-        raise_tiling_and_enforce_floating(win.pid, bounds, show_border, bwidth, bcolor, floating_ax_ids);
+        raise_tiling_and_enforce_floating(win.pid, win.window_id, bounds, show_border, bwidth, bcolor, floating_ax_ids);
     }
 
     fn modifier_key_held(&self, key: &str) -> bool {
@@ -387,12 +390,13 @@ fn pin_floating_on_top(pid: i32) {
 }
 
 unsafe fn pin_floating_on_top_sync(pid: i32) {
+    use objc::{msg_send, sel, sel_impl};
     let cls = match Class::get("NSRunningApplication") {
         Some(c) => c,
         None    => return,
     };
     let app: *mut Object = msg_send![cls,
-        runningApplicationWithProcessIdentifier: pid as i32
+        runningApplicationWithProcessIdentifier: pid
     ];
     if app.is_null() { return; }
 
@@ -404,26 +408,25 @@ unsafe fn pin_floating_on_top_sync(pid: i32) {
 
 fn raise_tiling_and_enforce_floating(
     tiled_pid: i32,
+    tiled_window_id: u32,
     bounds: (f64, f64, f64, f64),
     show_border: bool,
     border_width: f64,
     border_color: String,
     floating_ax_ids: HashSet<u32>
 ) {
-    // 1. Map AX IDs to PIDs outside the main queue to prevent blocking UI
     let floating_pids = get_visible_floating_pids(&floating_ax_ids);
 
     Queue::main().exec_async(move || {
         unsafe {
-            // 2. Bring tiling window to front
-            do_raise(tiled_pid);
+            // 1. Bring the exact single window instance to front
+            do_raise(tiled_pid, tiled_window_id);
             
-            // 3. Immediately pin floating windows back on top
+            // 2. Re-assert floating layers
             for pid in floating_pids {
                 pin_floating_on_top_sync(pid);
             }
 
-            // 4. Draw border
             if show_border {
                 crate::border::update_border(
                     bounds.0, bounds.1, bounds.2, bounds.3,
@@ -434,18 +437,21 @@ fn raise_tiling_and_enforce_floating(
     });
 }
 
-unsafe fn do_raise(pid: i32) {
-    accessibility::raise_app_window(pid, None);
+unsafe fn do_raise(pid: i32, window_id: u32) {
+    // Structural AXRaiseAction target
+    accessibility::raise_app_window(pid, Some(window_id));
 
+    use objc::{msg_send, sel, sel_impl};
     let cls = match Class::get("NSRunningApplication") {
         Some(c) => c,
         None    => return,
     };
     let app: *mut Object = msg_send![cls,
-        runningApplicationWithProcessIdentifier: pid as i32
+        runningApplicationWithProcessIdentifier: pid
     ];
     if !app.is_null() {
-        let _: bool = msg_send![app, activateWithOptions: 2u64];
+        // Option 1u64: NSApplicationActivateIgnoringOtherApps (Leaves window layout weights intact)
+        let _: bool = msg_send![app, activateWithOptions: 1u64];
     }
 }
 
@@ -463,10 +469,11 @@ extern "C" {
 
 #[derive(Debug)]
 struct WindowInfo {
-    pid:      i32,
-    app_name: String,
-    layer:    i32,
-    bounds:   (f64, f64, f64, f64),
+    pid:       i32,
+    window_id: u32,
+    app_name:  String,
+    layer:     i32,
+    bounds:    (f64, f64, f64, f64),
 }
 
 fn window_at_point(x: f64, y: f64) -> Option<WindowInfo> {
@@ -502,11 +509,13 @@ fn window_at_point(x: f64, y: f64) -> Option<WindowInfo> {
             let pid = get_dict_int(dict_ptr, kCGWindowOwnerPID).unwrap_or(0) as i32;
             if pid == 0 { continue; }
 
+            let window_id = get_dict_int(dict_ptr, kCGWindowNumber).unwrap_or(0) as u32;
+
             let app_name = get_dict_string(dict_ptr, kCGWindowOwnerName)
                 .unwrap_or_else(|| "Unknown".to_string());
 
             CFRelease(list as CFTypeRef);
-            return Some(WindowInfo { pid, app_name, layer, bounds });
+            return Some(WindowInfo { pid, window_id, app_name, layer, bounds });
         }
 
         CFRelease(list as CFTypeRef);
