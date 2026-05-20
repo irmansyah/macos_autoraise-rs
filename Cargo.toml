@@ -36,6 +36,9 @@ dirs-next = "2"
 # C bindings
 libc = "0.2"
 
+# GCD dispatch (for main-thread raise)
+dispatch = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Explicit link to macOS frameworks — handled via build.rs
 

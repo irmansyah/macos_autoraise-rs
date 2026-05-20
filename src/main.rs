@@ -13,6 +13,7 @@ mod aerospace;
 mod config;
 mod event_tap;
 mod raiser;
+mod border;
 
 use std::sync::{Arc, Mutex};
 use clap::Parser;
@@ -93,5 +94,5 @@ fn main() {
 
     let config = Arc::new(Mutex::new(cfg));
     let raiser = Raiser::new(config.clone());
-    raiser.run(); // blocks forever on the run loop
+    raiser.run() // -> ! blocks forever on CFRunLoopRun()
 }

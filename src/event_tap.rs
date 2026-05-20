@@ -1,21 +1,8 @@
-// event_tap.rs — CGEventTap setup for mouse-moved events
-//
-// This is the same low-level hook AutoRaise uses.
-// CGEventTap intercepts HID mouse events BEFORE they reach any application,
-// giving us the lowest possible latency — kernel-level, not polling.
-//
-// We install a PASSIVE tap (kCGEventTapOptionListenOnly) so we never
-// block input — identical performance characteristic to AutoRaise.
-//
-// The tap fires our callback on every mouse-moved event and sends the
-// coordinates to the raiser via a channel.
+// event_tap.rs — CGEventTap + run loop
 
 use std::sync::mpsc;
-use core_foundation::runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopDefaultMode};
-use core_foundation::base::TCFType;
 use log::debug;
 
-/// Message sent from the event tap to the raiser thread.
 #[derive(Debug, Clone)]
 pub struct MouseEvent {
     pub x: f64,
@@ -24,144 +11,164 @@ pub struct MouseEvent {
     pub delta_y: f64,
 }
 
-// ── CGEvent types (subset we need) ───────────────────────────────────────────
+type CGEventRef         = *mut std::ffi::c_void;
+type CFMachPortRef      = *mut std::ffi::c_void;
+type CFRunLoopRef       = *mut std::ffi::c_void;
+type CFRunLoopSourceRef = *mut std::ffi::c_void;
+type CFStringRef        = *const std::ffi::c_void;
+type CGEventMask        = u64;
+type CGEventType        = u32;
+type CGEventField       = u32;
+type CFTimeInterval     = f64;
 
-type CGEventRef = *mut std::ffi::c_void;
-type CGEventTapRef = *mut std::ffi::c_void;
-type CFMachPortRef = *mut std::ffi::c_void;
-type CGEventMask = u64;
-type CGEventType = u32;
-type CGEventField = u32;
-
-const kCGEventMouseMoved: CGEventType = 5;
-const kCGEventLeftMouseDragged: CGEventType = 6;
-const kCGEventRightMouseDragged: CGEventType = 7;
-const kCGEventOtherMouseDragged: CGEventType = 27;
-
-const kCGMouseEventDeltaX: CGEventField = 1;
-const kCGMouseEventDeltaY: CGEventField = 2;
-
-const kCGHIDEventTap: u32 = 0;
-const kCGHeadInsertEventTap: u32 = 0;
-const kCGEventTapOptionListenOnly: u32 = 1; // passive — never blocks input
+const kCGEventMouseMoved:          CGEventType = 5;
+const kCGEventLeftMouseDragged:    CGEventType = 6;
+const kCGEventRightMouseDragged:   CGEventType = 7;
+const kCGEventOtherMouseDragged:   CGEventType = 27;
+const kCGMouseEventDeltaX:         CGEventField = 1;
+const kCGMouseEventDeltaY:         CGEventField = 2;
+const kCGHIDEventTap:              u32 = 0;
+const kCGHeadInsertEventTap:       u32 = 0;
+const kCGEventTapOptionListenOnly: u32 = 1;
 
 type CGEventTapCallBack = unsafe extern "C" fn(
-    proxy: *mut std::ffi::c_void,
-    etype: CGEventType,
-    event: CGEventRef,
+    proxy:     *mut std::ffi::c_void,
+    etype:     CGEventType,
+    event:     CGEventRef,
     user_info: *mut std::ffi::c_void,
 ) -> CGEventRef;
 
 #[repr(C)]
-struct CGPoint {
-    x: f64,
-    y: f64,
-}
+struct CGPoint { x: f64, y: f64 }
 
 extern "C" {
     fn CGEventTapCreate(
-        tap: u32,
-        place: u32,
-        options: u32,
+        tap:                u32,
+        place:              u32,
+        options:            u32,
         events_of_interest: CGEventMask,
-        callback: CGEventTapCallBack,
-        user_info: *mut std::ffi::c_void,
+        callback:           CGEventTapCallBack,
+        user_info:          *mut std::ffi::c_void,
     ) -> CFMachPortRef;
 
     fn CFMachPortCreateRunLoopSource(
         allocator: *mut std::ffi::c_void,
-        port: CFMachPortRef,
-        order: std::ffi::c_long,
-    ) -> *mut std::ffi::c_void; // CFRunLoopSourceRef
+        port:      CFMachPortRef,
+        order:     std::ffi::c_long,
+    ) -> CFRunLoopSourceRef;
+
+    fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFRunLoopRunInMode(mode: CFStringRef, seconds: CFTimeInterval, return_after_source_handled: u8) -> i32;
+
+    static kCFRunLoopDefaultMode: CFStringRef;
 
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventGetIntegerValueField(event: CGEventRef, field: CGEventField) -> i64;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {}
+#[link(name = "CoreGraphics",        kind = "framework")] extern "C" {}
+#[link(name = "CoreFoundation",      kind = "framework")] extern "C" {}
+#[link(name = "ApplicationServices", kind = "framework")] extern "C" {}
 
-// ── Tap state passed through the C callback ───────────────────────────────────
+// ── Tap state — uses a raw fn pointer + eprintln so it works even if the
+//   logger isn't flushed (lets us confirm the callback fires at all)      ──────
 
 struct TapState {
     sender: mpsc::SyncSender<MouseEvent>,
+    fired:  std::sync::atomic::AtomicBool,
 }
 
-/// Install the CGEventTap and start sending MouseEvents to `sender`.
-/// This MUST be called on the main thread (or any thread that runs a CFRunLoop).
-/// It adds a source to the *current* thread's run loop.
 pub fn install_event_tap(sender: mpsc::SyncSender<MouseEvent>) {
-    // Mask: mouse moved + all drag variants
     let mask: CGEventMask =
         (1 << kCGEventMouseMoved)
         | (1 << kCGEventLeftMouseDragged)
         | (1 << kCGEventRightMouseDragged)
         | (1 << kCGEventOtherMouseDragged);
 
-    let state = Box::new(TapState { sender });
+    let state = Box::new(TapState {
+        sender,
+        fired: std::sync::atomic::AtomicBool::new(false),
+    });
     let state_ptr = Box::into_raw(state) as *mut std::ffi::c_void;
 
     unsafe {
         let tap = CGEventTapCreate(
             kCGHIDEventTap,
             kCGHeadInsertEventTap,
-            kCGEventTapOptionListenOnly, // passive — no input blocking
+            kCGEventTapOptionListenOnly,
             mask,
             tap_callback,
             state_ptr,
         );
-
         if tap.is_null() {
             panic!(
-                "CGEventTapCreate failed — ensure Accessibility permission is granted.\n\
-                 System Settings → Privacy & Security → Accessibility → add this binary."
+                "CGEventTapCreate returned null.\n\
+                 Grant Accessibility: System Settings → Privacy & Security → Accessibility\n\
+                 Add the binary and toggle it ON, then re-run."
             );
         }
 
-        let source = CFMachPortCreateRunLoopSource(
-            std::ptr::null_mut(),
-            tap,
-            0,
-        );
+        eprintln!("[tap] CGEventTapCreate OK: {:?}", tap);
+
+        let source = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
         if source.is_null() {
             panic!("CFMachPortCreateRunLoopSource failed");
         }
+        eprintln!("[tap] RunLoopSource OK: {:?}", source);
 
-        // Add source to current thread's run loop
-        let rl = CFRunLoop::get_current();
-        let mode = unsafe { kCFRunLoopDefaultMode };
-        CFRunLoop::add_source(&rl, unsafe {
-            &core_foundation::runloop::CFRunLoopSource::wrap_under_create_rule(
-                source as *mut _
-            )
-        }, mode);
+        let rl = CFRunLoopGetCurrent();
+        eprintln!("[tap] RunLoop: {:?}", rl);
+
+        CFRunLoopAddSource(rl, source, kCFRunLoopDefaultMode);
+        eprintln!("[tap] Source added to run loop");
 
         CGEventTapEnable(tap, true);
+        eprintln!("[tap] Tap enabled — move mouse now");
+
         debug!("CGEventTap installed ✓");
     }
 }
 
-/// The C callback invoked by the kernel for each mouse event.
-/// Runs on the run loop thread — must be fast (no allocation, no blocking).
+pub fn run_loop() -> ! {
+    eprintln!("[tap] Entering run loop...");
+    let mut ticks: u64 = 0;
+    unsafe {
+        loop {
+            let result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, 0);
+            ticks += 1;
+            // Print a heartbeat every 5 seconds so we know the loop is alive
+            if ticks % 5 == 0 {
+                eprintln!("[tap] run loop alive (tick={ticks}, result={result}) — move mouse to test");
+            }
+        }
+    }
+}
+
 unsafe extern "C" fn tap_callback(
-    _proxy: *mut std::ffi::c_void,
-    etype: CGEventType,
-    event: CGEventRef,
+    _proxy:    *mut std::ffi::c_void,
+    _etype:    CGEventType,
+    event:     CGEventRef,
     user_info: *mut std::ffi::c_void,
 ) -> CGEventRef {
     let state = &*(user_info as *const TapState);
-    let pos = CGEventGetLocation(event);
-    let dx = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX) as f64;
-    let dy = CGEventGetIntegerValueField(event, kCGMouseEventDeltaY) as f64;
 
-    // Non-blocking send — drop the event if the raiser is behind
+    // First-fire diagnostic — print directly so it can't be lost
+    if !state.fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[tap] *** FIRST CALLBACK FIRED *** tap is working!");
+    }
+
+    let pos = CGEventGetLocation(event);
+    let dx  = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX) as f64;
+    let dy  = CGEventGetIntegerValueField(event, kCGMouseEventDeltaY) as f64;
+
+    // eprintln!("[tap] mouse ({:.0},{:.0})", pos.x, pos.y);  // uncomment if needed
+
     let _ = state.sender.try_send(MouseEvent {
-        x: pos.x,
-        y: pos.y,
-        delta_x: dx,
-        delta_y: dy,
+        x: pos.x, y: pos.y,
+        delta_x: dx, delta_y: dy,
     });
 
-    event // passive tap: always return the event unchanged
+    event
 }

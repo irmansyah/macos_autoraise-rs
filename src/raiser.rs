@@ -5,13 +5,11 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use log::{debug, info};
-use core_foundation::runloop::CFRunLoop;
+use log::{debug, info, warn};
 use core_foundation::base::{CFTypeRef, TCFType};
-use core_foundation::array::{CFArray, CFArrayRef};
-use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::array::CFArrayRef;
+use core_foundation::dictionary::CFDictionaryRef;
 use core_foundation::string::{CFString, CFStringRef};
-use core_foundation::number::{CFNumber, CFNumberRef};
 
 use crate::config::Config;
 use crate::aerospace::AeroSpaceState;
@@ -21,7 +19,7 @@ use crate::accessibility;
 // ── CGWindowListCopyWindowInfo ────────────────────────────────────────────────
 
 type CGWindowID = u32;
-const kCGWindowListOptionOnScreenOnly: u32     = 1 << 0;
+const kCGWindowListOptionOnScreenOnly:     u32 = 1 << 0;
 const kCGWindowListExcludeDesktopElements: u32 = 1 << 4;
 const kCGNullWindowID: CGWindowID = 0;
 
@@ -29,7 +27,7 @@ extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relativeToWindow: CGWindowID) -> CFArrayRef;
 }
 
-// ── Modifier key state ────────────────────────────────────────────────────────
+// ── Modifier key ──────────────────────────────────────────────────────────────
 
 extern "C" {
     fn CGEventSourceFlagsState(stateID: u32) -> u64;
@@ -38,10 +36,11 @@ const kCGEventSourceStateCombinedSessionState: u32 = 1;
 const kCGEventFlagMaskAlternate: u64 = 0x0008_0000;
 const kCGEventFlagMaskControl:   u64 = 0x0004_0000;
 
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {}
+#[link(name = "CoreGraphics", kind = "framework")] extern "C" {}
+#[link(name = "AppKit", kind = "framework")] extern "C" {}
 
-// ── NSRunningApplication ──────────────────────────────────────────────────────
+// GCD — dispatch raise to main thread so AppKit calls work correctly
+use dispatch::Queue;
 
 use objc::runtime::{Class, Object};
 use objc::{msg_send, sel, sel_impl};
@@ -65,13 +64,14 @@ impl Raiser {
         Self { config }
     }
 
-    pub fn run(self) {
+    pub fn run(self) -> ! {
         let cfg = self.config.lock().unwrap().clone();
         let poll_millis      = cfg.poll_millis;
         let aerospace_cycles = cfg.aerospace_refresh_cycles;
         let aerospace_aware  = cfg.aerospace_aware;
         drop(cfg);
 
+        // Bounded channel — drop oldest if raiser falls behind
         let (tx, rx) = std::sync::mpsc::sync_channel::<MouseEvent>(64);
 
         let config_clone = self.config.clone();
@@ -83,6 +83,7 @@ impl Raiser {
                 poll_millis,
             );
             loop {
+                // Drain, keep only latest position
                 let mut last: Option<MouseEvent> = None;
                 while let Ok(ev) = rx.try_recv() {
                     last = Some(ev);
@@ -97,7 +98,7 @@ impl Raiser {
         event_tap::install_event_tap(tx);
 
         info!("Running. Move mouse over any window to trigger auto-raise.");
-        unsafe { CFRunLoop::run_current() };
+        event_tap::run_loop()
     }
 }
 
@@ -108,12 +109,14 @@ struct RaiserState {
     aerospace: Option<AeroSpaceState>,
     poll_millis: u64,
     last_window_pid: Option<i32>,
-    hover_ticks: u32,
+    // how many consecutive ticks the mouse has been still
     still_ticks: u32,
     last_x: f64,
     last_y: f64,
     aerospace_cycle_counter: u32,
     aerospace_refresh_cycles: u32,
+    // track whether we already raised the current window
+    raised_pid: Option<i32>,
 }
 
 impl RaiserState {
@@ -133,19 +136,20 @@ impl RaiserState {
             aerospace,
             poll_millis,
             last_window_pid: None,
-            hover_ticks: 0,
             still_ticks: 0,
-            last_x: -1.0,
-            last_y: -1.0,
+            last_x: -9999.0,
+            last_y: -9999.0,
             aerospace_cycle_counter: 0,
             aerospace_refresh_cycles: aerospace_cycles,
+            raised_pid: None,
         }
     }
 
     fn handle_mouse_event(&mut self, ev: MouseEvent) {
         let (x, y) = (ev.x, ev.y);
-        let moved = (x - self.last_x).abs() > 0.5 || (y - self.last_y).abs() > 0.5;
+        let moved = (x - self.last_x).abs() > 1.0 || (y - self.last_y).abs() > 1.0;
 
+        // Periodic AeroSpace refresh
         self.aerospace_cycle_counter += 1;
         if self.aerospace_cycle_counter >= self.aerospace_refresh_cycles {
             self.aerospace_cycle_counter = 0;
@@ -156,102 +160,117 @@ impl RaiserState {
 
         let cfg = self.config.lock().unwrap().clone();
 
-        // 1. Modifier key
+        // ── 1. Modifier key disable ───────────────────────────────────────────
         if self.modifier_key_held(&cfg.disable_key) {
-            debug!("Disabled by modifier key");
+            debug!("Raising disabled (modifier held)");
+            self.last_x = x;
+            self.last_y = y;
             return;
         }
 
-        // 2. Window under cursor
+        // ── 2. Find window under cursor ───────────────────────────────────────
         let win = match window_at_point(x, y) {
             Some(w) => w,
             None => {
+                debug!("No window at ({x:.0},{y:.0})");
                 self.last_window_pid = None;
-                self.hover_ticks = 0;
+                self.raised_pid = None;
+                self.still_ticks = 0;
                 self.last_x = x;
                 self.last_y = y;
                 return;
             }
         };
 
-        debug!("Window: pid={} app='{}' layer={}", win.pid, win.app_name, win.layer);
+        debug!(
+            "At ({x:.0},{y:.0}): app='{}' pid={} layer={}",
+            win.app_name, win.pid, win.layer
+        );
 
-        // 3. Skip panels/menus (layer != 0)
-        if win.layer != 0 { return; }
+        self.last_x = x;
+        self.last_y = y;
 
-        // 4. Ignore lists
-        let app_lower = win.app_name.to_lowercase();
-        if cfg.ignore_apps.iter().any(|a| a.to_lowercase() == app_lower) {
-            debug!("Ignoring app: {}", win.app_name);
+        // ── 3. Skip non-normal layers (menus, panels, HUD, dock) ─────────────
+        if win.layer != 0 {
+            debug!("  → skip layer {}", win.layer);
             return;
         }
+
+        // ── 4. Ignore app list ────────────────────────────────────────────────
+        let app_lower = win.app_name.to_lowercase();
+        if cfg.ignore_apps.iter().any(|a| a.to_lowercase() == app_lower) {
+            debug!("  → ignored app");
+            return;
+        }
+
+        // ── 5. Ignore title list ──────────────────────────────────────────────
         if !cfg.ignore_titles.is_empty() {
             if let Some(title) = accessibility::get_window_title(win.pid) {
                 let tl = title.to_lowercase();
                 if cfg.ignore_titles.iter().any(|t| tl.contains(&t.to_lowercase())) {
-                    debug!("Ignoring title: {title}");
+                    debug!("  → ignored title '{title}'");
                     return;
                 }
             }
         }
 
-        // 5. AeroSpace: skip tiled windows
+        // ── 6. AeroSpace: skip tiled windows ─────────────────────────────────
         if let Some(ref as_state) = self.aerospace {
             if as_state.available {
                 if let Some(ax_id) = accessibility::get_ax_window_id(win.pid) {
                     if !as_state.should_raise(ax_id) {
-                        debug!("Skipping tiled: app='{}' ax_id={ax_id}", win.app_name);
+                        debug!("  → tiled (AeroSpace manages focus)");
+                        // Reset so moving back to a floating window works
                         if self.last_window_pid != Some(win.pid) {
-                            self.hover_ticks = 0;
+                            self.raised_pid = None;
                         }
                         self.last_window_pid = Some(win.pid);
-                        self.last_x = x;
-                        self.last_y = y;
                         return;
                     }
                 }
             }
         }
 
-        // 6. Delay logic
+        // ── 7. Detect window change ───────────────────────────────────────────
         let new_window = self.last_window_pid != Some(win.pid);
-        if new_window { self.hover_ticks = 0; self.still_ticks = 0; }
+        if new_window {
+            debug!("  → new window, resetting state");
+            self.still_ticks = 0;
+            self.raised_pid = None;
+        }
         self.last_window_pid = Some(win.pid);
-        self.last_x = x;
-        self.last_y = y;
 
+        // Track stillness
         if moved { self.still_ticks = 0; } else { self.still_ticks += 1; }
 
-        let delay = cfg.delay;
-        if delay == 0 { return; }
-        if delay == 1 {
-            if !new_window { return; }
-        } else if cfg.require_mouse_stop && self.still_ticks < delay {
+        // ── 8. Already raised this window? ────────────────────────────────────
+        if self.raised_pid == Some(win.pid) {
             return;
         }
 
-        self.hover_ticks += 1;
-        if self.hover_ticks > 1 { return; }
-
-        // 7. Raise
-        debug!("Raising: app='{}' pid={}", win.app_name, win.pid);
-        self.do_raise(win.pid);
-    }
-
-    fn do_raise(&self, pid: i32) {
-        accessibility::raise_app_window(pid, None);
-        unsafe {
-            let cls = match Class::get("NSRunningApplication") {
-                Some(c) => c,
-                None    => return,
-            };
-            let app: *mut Object = msg_send![cls,
-                runningApplicationWithProcessIdentifier: pid as i32
-            ];
-            if !app.is_null() {
-                let _: bool = msg_send![app, activateWithOptions: 2u64];
-            }
+        // ── 9. Delay gate ─────────────────────────────────────────────────────
+        let delay = cfg.delay;
+        if delay == 0 {
+            return; // raising disabled
         }
+        if delay > 1 && cfg.require_mouse_stop && self.still_ticks < delay {
+            debug!("  → waiting ({}/{})", self.still_ticks, delay);
+            return;
+        }
+
+        // ── 10. Raise! ────────────────────────────────────────────────────────
+        let pid = win.pid;
+        let bounds = win.bounds; // Capture bounds
+        let app = win.app_name.clone();
+        
+        let border_width = cfg.border_width;
+        let border_color = cfg.border_color.clone();
+
+        debug!("  → RAISING '{}' pid={}", app, pid);
+        self.raised_pid = Some(pid);
+
+        // Update the function call:
+        raise_on_main_thread(pid, bounds, border_width, border_color);
     }
 
     fn modifier_key_held(&self, key: &str) -> bool {
@@ -267,6 +286,47 @@ impl RaiserState {
     }
 }
 
+// ── Raise dispatched to main thread ──────────────────────────────────────────
+
+fn raise_on_main_thread(pid: i32, bounds: (f64, f64, f64, f64), b_width: f64, b_color: String) {
+    Queue::main().exec_async(move || {
+        unsafe { 
+            do_raise(pid); 
+            
+            // Draw the border immediately after raising
+            crate::border::update_border(bounds.0, bounds.1, bounds.2, bounds.3, b_width, &b_color);
+        };
+    });
+}
+
+unsafe fn do_raise(pid: i32) {
+    // AXRaise — brings window to front within the app
+    accessibility::raise_app_window(pid, None);
+
+    // Activate the app — switches focus
+    let cls = match Class::get("NSRunningApplication") {
+        Some(c) => c,
+        None    => return,
+    };
+    let app: *mut Object = msg_send![cls,
+        runningApplicationWithProcessIdentifier: pid as i32
+    ];
+    if !app.is_null() {
+        // NSApplicationActivateIgnoringOtherApps = 2
+        let _: bool = msg_send![app, activateWithOptions: 2u64];
+    }
+}
+
+// ── CoreFoundation Raw FFI ────────────────────────────────────────────────────
+
+extern "C" {
+    fn CFArrayGetCount(theArray: CFArrayRef) -> isize;
+    fn CFArrayGetValueAtIndex(theArray: CFArrayRef, idx: isize) -> CFTypeRef;
+    fn CFDictionaryGetValue(theDict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
+    fn CFNumberGetValue(number: CFTypeRef, theType: i64, valuePtr: *mut std::ffi::c_void) -> bool;
+    fn CFRelease(cf: CFTypeRef);
+}
+
 // ── Window hit-test ───────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -275,6 +335,7 @@ struct WindowInfo {
     app_name:  String,
     window_id: u32,
     layer:     i32,
+    bounds:    (f64, f64, f64, f64),
 }
 
 fn window_at_point(x: f64, y: f64) -> Option<WindowInfo> {
@@ -283,20 +344,28 @@ fn window_at_point(x: f64, y: f64) -> Option<WindowInfo> {
             kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
             kCGNullWindowID,
         );
-        if list.is_null() { return None; }
+        if list.is_null() {
+            warn!("[raiser] CGWindowListCopyWindowInfo returned NULL");
+            return None;
+        }
 
-        let arr = CFArray::<CFDictionary>::wrap_under_create_rule(list as *mut _);
+        let count = CFArrayGetCount(list);
+        debug!("[raiser] window list count={}, cursor=({x:.1},{y:.1})", count);
 
-        for i in 0..arr.len() {
-            let dict_ptr = &arr.get(i as isize) as *const _ as CFDictionaryRef;
-            let dict = CFDictionary::<CFString, CFTypeRef>::wrap_under_get_rule(dict_ptr);
+        for i in 0..count {
+            let dict_ptr = CFArrayGetValueAtIndex(list, i) as CFDictionaryRef;
+            if dict_ptr.is_null() { continue; }
 
-            let layer  = get_dict_int(&dict, kCGWindowLayer).unwrap_or(999) as i32;
-            let bounds = match get_dict_bounds(&dict, kCGWindowBounds) {
+            let layer = get_dict_int(dict_ptr, kCGWindowLayer).unwrap_or(999) as i32;
+            let bounds = match get_dict_bounds(dict_ptr, kCGWindowBounds) {
                 Some(b) => b,
                 None    => continue,
             };
 
+            debug!("[raiser]   layer={layer:3} bounds=({:.0},{:.0},{:.0},{:.0})",
+                bounds.0, bounds.1, bounds.2, bounds.3);
+
+            // Point-in-bounds test
             if x < bounds.0 || y < bounds.1
                 || x > bounds.0 + bounds.2
                 || y > bounds.1 + bounds.3
@@ -304,51 +373,74 @@ fn window_at_point(x: f64, y: f64) -> Option<WindowInfo> {
                 continue;
             }
 
-            let pid = get_dict_int(&dict, kCGWindowOwnerPID).unwrap_or(0) as i32;
+            let pid = get_dict_int(dict_ptr, kCGWindowOwnerPID).unwrap_or(0) as i32;
             if pid == 0 { continue; }
 
-            let app_name  = get_dict_string(&dict, kCGWindowOwnerName)
+            let app_name = get_dict_string(dict_ptr, kCGWindowOwnerName)
                 .unwrap_or_else(|| "Unknown".to_string());
-            let window_id = get_dict_int(&dict, kCGWindowNumber).unwrap_or(0) as u32;
+            let window_id = get_dict_int(dict_ptr, kCGWindowNumber).unwrap_or(0) as u32;
 
-            return Some(WindowInfo { pid, app_name, window_id, layer });
+            // Replace the old return Some(...) inside window_at_point with:
+            CFRelease(list as CFTypeRef);
+            return Some(WindowInfo { pid, app_name, window_id, layer, bounds });
         }
+        
+        // Release the list if no match found
+        CFRelease(list as CFTypeRef);
         None
     }
 }
 
-// ── CFDictionary helpers ──────────────────────────────────────────────────────
+// ── Safe CFDictionary helpers ─────────────────────────────────────────────────
 
-unsafe fn get_dict_int(
-    dict: &CFDictionary<CFString, CFTypeRef>,
-    key: &str,
-) -> Option<i64> {
+unsafe fn get_dict_int(dict: CFDictionaryRef, key: &str) -> Option<i64> {
     let k = CFString::new(key);
-    let val_ptr = dict.find(k.as_concrete_TypeRef())?;
-    CFNumber::wrap_under_get_rule(*val_ptr as CFNumberRef).to_i64()
+    let val_ptr = CFDictionaryGetValue(dict, k.as_CFTypeRef());
+    if val_ptr.is_null() { return None; }
+
+    let mut val: i64 = 0;
+    // kCFNumberSInt64Type = 4
+    if CFNumberGetValue(val_ptr, 4, &mut val as *mut i64 as *mut _) {
+        Some(val)
+    } else {
+        None
+    }
 }
 
-unsafe fn get_dict_string(
-    dict: &CFDictionary<CFString, CFTypeRef>,
-    key: &str,
-) -> Option<String> {
+unsafe fn get_dict_f64(dict: CFDictionaryRef, key: &str) -> Option<f64> {
     let k = CFString::new(key);
-    let val_ptr = dict.find(k.as_concrete_TypeRef())?;
-    Some(CFString::wrap_under_get_rule(*val_ptr as CFStringRef).to_string())
+    let val_ptr = CFDictionaryGetValue(dict, k.as_CFTypeRef());
+    if val_ptr.is_null() { return None; }
+
+    let mut val: f64 = 0.0;
+    // kCFNumberFloat64Type = 13
+    if CFNumberGetValue(val_ptr, 13, &mut val as *mut f64 as *mut _) {
+        Some(val)
+    } else {
+        None
+    }
 }
 
-unsafe fn get_dict_bounds(
-    dict: &CFDictionary<CFString, CFTypeRef>,
-    key: &str,
-) -> Option<(f64, f64, f64, f64)> {
+unsafe fn get_dict_string(dict: CFDictionaryRef, key: &str) -> Option<String> {
     let k = CFString::new(key);
-    let val_ptr = dict.find(k.as_concrete_TypeRef())?;
-    let sub = CFDictionary::<CFString, CFTypeRef>::wrap_under_get_rule(
-        *val_ptr as CFDictionaryRef,
-    );
-    let x = get_dict_int(&sub, "X").unwrap_or(0) as f64;
-    let y = get_dict_int(&sub, "Y").unwrap_or(0) as f64;
-    let w = get_dict_int(&sub, "Width").unwrap_or(0) as f64;
-    let h = get_dict_int(&sub, "Height").unwrap_or(0) as f64;
+    let val_ptr = CFDictionaryGetValue(dict, k.as_CFTypeRef());
+    if val_ptr.is_null() { return None; }
+
+    let cf_str = CFString::wrap_under_get_rule(val_ptr as CFStringRef);
+    Some(cf_str.to_string())
+}
+
+unsafe fn get_dict_bounds(dict: CFDictionaryRef, key: &str) -> Option<(f64, f64, f64, f64)> {
+    let k = CFString::new(key);
+    let val_ptr = CFDictionaryGetValue(dict, k.as_CFTypeRef());
+    if val_ptr.is_null() { return None; }
+
+    let sub_dict = val_ptr as CFDictionaryRef;
+    let x = get_dict_f64(sub_dict, "X").unwrap_or(0.0);
+    let y = get_dict_f64(sub_dict, "Y").unwrap_or(0.0);
+    let w = get_dict_f64(sub_dict, "Width").unwrap_or(0.0);
+    let h = get_dict_f64(sub_dict, "Height").unwrap_or(0.0);
+    
+    if w == 0.0 || h == 0.0 { return None; }
     Some((x, y, w, h))
 }

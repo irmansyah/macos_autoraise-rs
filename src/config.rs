@@ -39,6 +39,14 @@ pub struct Config {
     /// Poll cycles between AeroSpace floating window list refresh
     #[serde(default = "default_aerospace_refresh")]
     pub aerospace_refresh_cycles: u32,
+
+    /// Border width (0.0 means disabled)
+    #[serde(default = "default_border_width")]
+    pub border_width: f64,
+
+    /// Border hex color
+    #[serde(default = "default_border_color")]
+    pub border_color: String,
 }
 
 fn default_poll_millis() -> u64 { 50 }
@@ -46,6 +54,8 @@ fn default_delay() -> u32 { 1 }
 fn default_disable_key() -> String { "control".to_string() }
 fn default_true() -> bool { true }
 fn default_aerospace_refresh() -> u32 { 10 }
+fn default_border_width() -> f64 { 4.0 }
+fn default_border_color() -> String { "#FF3366".to_string() }
 
 impl Default for Config {
     fn default() -> Self {
@@ -58,6 +68,8 @@ impl Default for Config {
             require_mouse_stop: true,
             aerospace_aware: true,
             aerospace_refresh_cycles: default_aerospace_refresh(),
+            border_width: default_border_width(),
+            border_color: default_border_color(),
         }
     }
 }
