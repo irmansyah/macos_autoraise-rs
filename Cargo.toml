@@ -6,6 +6,12 @@ description = "Focus-follows-mouse & auto-raise for macOS, written in Rust"
 authors = ["you"]
 license = "MIT"
 
+# Suppress the `unexpected_cfg` warning from the `objc` crate's `sel_impl` macro.
+# The macro uses `cfg(cargo-clippy)` internally which Rust now warns about.
+# This is a known issue in objc 0.2 — suppressed here until the crate is updated.
+[lints.rust]
+unexpected_cfgs = "allow"
+
 [[bin]]
 name = "autoraise-rs"
 path = "src/main.rs"
@@ -29,9 +35,6 @@ regex = "1"
 # Logging
 log = "0.4"
 env_logger = "0.11"
-
-# Config path resolution (~/.config/...)
-dirs-next = "2"
 
 # C bindings
 libc = "0.2"

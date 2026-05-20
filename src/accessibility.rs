@@ -1,14 +1,4 @@
 // accessibility.rs — macOS Accessibility API wrappers
-//
-// We use the raw C AX API through Rust's FFI.  This is identical to what
-// AutoRaise (ObjC++) calls; zero overhead difference.
-//
-// Key calls:
-//   AXIsProcessTrusted()             — check permissions
-//   AXUIElementCreateApplication()   — app element from PID
-//   AXUIElementCopyAttributeValue()  — read attributes
-//   AXUIElementPerformAction()       — raise / press
-//   _AXUIElementGetWindow()          — get raw window ID (same private API AutoRaise uses)
 
 use core_foundation::base::{CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
@@ -21,39 +11,72 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn AXUIElementCreateApplication(pid: libc::pid_t) -> AXUIElementRef;
     fn AXUIElementCopyAttributeValue(
-        element: AXUIElementRef,
+        element:   AXUIElementRef,
         attribute: CFStringRef,
-        value: *mut CFTypeRef,
+        value:     *mut CFTypeRef,
     ) -> i32;
     fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> i32;
     fn AXUIElementSetAttributeValue(
-        element: AXUIElementRef,
+        element:   AXUIElementRef,
         attribute: CFStringRef,
-        value: CFTypeRef,
+        value:     CFTypeRef,
     ) -> i32;
     fn _AXUIElementGetWindow(element: AXUIElementRef, out: *mut u32) -> i32;
     fn CFRelease(cf: CFTypeRef);
+    fn CFArrayGetCount(arr: CFTypeRef) -> isize;
+    fn CFArrayGetValueAtIndex(arr: CFTypeRef, idx: isize) -> *mut std::ffi::c_void;
 }
 
 pub type AXUIElementRef = *mut std::ffi::c_void;
 
-// AX attribute / action name constants
 const kAXFocusedWindowAttribute: &str = "AXFocusedWindow";
+const kAXWindowsAttribute: &str       = "AXWindows";
 const kAXRaiseAction: &str            = "AXRaise";
 const kAXMainAttribute: &str          = "AXMain";
 const kAXTitleAttribute: &str         = "AXTitle";
-
 const kAXErrorSuccess: i32 = 0;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Returns true if this process has Accessibility permission.
 pub fn is_trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
+/// Return the AXUIElement for an app by PID.
+/// Caller must CFRelease the returned element when done.
+pub fn ax_app_element(pid: i32) -> AXUIElementRef {
+    unsafe { AXUIElementCreateApplication(pid as libc::pid_t) }
+}
+
+/// AXRaise all windows of an app element so they stay above tiled windows.
+/// Used for floating windows — keeps them on top without changing focus.
+/// Takes ownership of app_elem and releases it.
+pub fn set_windows_floating(app_elem: AXUIElementRef) {
+    if app_elem.is_null() { return; }
+    unsafe {
+        let wins_attr = CFString::new(kAXWindowsAttribute);
+        let mut value: CFTypeRef = std::ptr::null_mut();
+        let err = AXUIElementCopyAttributeValue(
+            app_elem,
+            wins_attr.as_concrete_TypeRef(),
+            &mut value,
+        );
+        if err == kAXErrorSuccess && !value.is_null() {
+            let count = CFArrayGetCount(value);
+            let raise_action = CFString::new(kAXRaiseAction);
+            for i in 0..count {
+                let win = CFArrayGetValueAtIndex(value, i);
+                if !win.is_null() {
+                    AXUIElementPerformAction(win, raise_action.as_concrete_TypeRef());
+                }
+            }
+            CFRelease(value);
+        }
+        CFRelease(app_elem as CFTypeRef);
+    }
+}
+
 /// Raise the frontmost window of the given PID.
-/// Returns the raw CGWindowID on success.
 pub fn raise_app_window(pid: i32, window_ax_id_hint: Option<u32>) -> Option<u32> {
     unsafe {
         let app_elem = AXUIElementCreateApplication(pid as libc::pid_t);
@@ -67,11 +90,9 @@ pub fn raise_app_window(pid: i32, window_ax_id_hint: Option<u32>) -> Option<u32>
             }
         };
 
-        // Get raw CGWindowID
         let mut wid: u32 = 0;
         let id_err = _AXUIElementGetWindow(win, &mut wid);
 
-        // If caller gave a hint and it doesn't match, skip this window
         if let Some(hint) = window_ax_id_hint {
             if id_err == kAXErrorSuccess && wid != 0 && wid != hint {
                 CFRelease(win as CFTypeRef);
@@ -80,14 +101,12 @@ pub fn raise_app_window(pid: i32, window_ax_id_hint: Option<u32>) -> Option<u32>
             }
         }
 
-        // AXRaise
         let raise_action = CFString::new(kAXRaiseAction);
         let raise_err = AXUIElementPerformAction(win, raise_action.as_concrete_TypeRef());
 
         if raise_err == kAXErrorSuccess {
             debug!("AXRaise succeeded for pid={pid} wid={wid}");
         } else {
-            // Fallback: set AXMain = true
             let main_attr = CFString::new(kAXMainAttribute);
             let cf_true   = core_foundation::boolean::CFBoolean::true_value();
             AXUIElementSetAttributeValue(
@@ -104,7 +123,7 @@ pub fn raise_app_window(pid: i32, window_ax_id_hint: Option<u32>) -> Option<u32>
     }
 }
 
-/// Get the window title of the frontmost window for a PID (used for ignoreTitles).
+/// Get the window title of the frontmost window for a PID.
 pub fn get_window_title(pid: i32) -> Option<String> {
     unsafe {
         let app_elem = AXUIElementCreateApplication(pid as libc::pid_t);
@@ -130,7 +149,6 @@ pub fn get_window_title(pid: i32) -> Option<String> {
         CFRelease(app_elem as CFTypeRef);
 
         if err == kAXErrorSuccess && !value.is_null() {
-            // wrap_under_create_rule takes ownership — will CFRelease on drop
             let cf_str = CFString::wrap_under_create_rule(value as CFStringRef);
             Some(cf_str.to_string())
         } else {
@@ -180,7 +198,7 @@ unsafe fn get_focused_window(app_elem: AXUIElementRef) -> Option<AXUIElementRef>
     }
 }
 
-// ── Linker directives ─────────────────────────────────────────────────────────
+// ── Linker ────────────────────────────────────────────────────────────────────
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {}

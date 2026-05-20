@@ -7,8 +7,6 @@ use log::debug;
 pub struct MouseEvent {
     pub x: f64,
     pub y: f64,
-    pub delta_x: f64,
-    pub delta_y: f64,
 }
 
 type CGEventRef         = *mut std::ffi::c_void;
@@ -18,15 +16,12 @@ type CFRunLoopSourceRef = *mut std::ffi::c_void;
 type CFStringRef        = *const std::ffi::c_void;
 type CGEventMask        = u64;
 type CGEventType        = u32;
-type CGEventField       = u32;
 type CFTimeInterval     = f64;
 
 const kCGEventMouseMoved:          CGEventType = 5;
 const kCGEventLeftMouseDragged:    CGEventType = 6;
 const kCGEventRightMouseDragged:   CGEventType = 7;
 const kCGEventOtherMouseDragged:   CGEventType = 27;
-const kCGMouseEventDeltaX:         CGEventField = 1;
-const kCGMouseEventDeltaY:         CGEventField = 2;
 const kCGHIDEventTap:              u32 = 0;
 const kCGHeadInsertEventTap:       u32 = 0;
 const kCGEventTapOptionListenOnly: u32 = 1;
@@ -64,7 +59,6 @@ extern "C" {
     static kCFRunLoopDefaultMode: CFStringRef;
 
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
-    fn CGEventGetIntegerValueField(event: CGEventRef, field: CGEventField) -> i64;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
 }
 
@@ -160,14 +154,9 @@ unsafe extern "C" fn tap_callback(
     }
 
     let pos = CGEventGetLocation(event);
-    let dx  = CGEventGetIntegerValueField(event, kCGMouseEventDeltaX) as f64;
-    let dy  = CGEventGetIntegerValueField(event, kCGMouseEventDeltaY) as f64;
-
-    // eprintln!("[tap] mouse ({:.0},{:.0})", pos.x, pos.y);  // uncomment if needed
 
     let _ = state.sender.try_send(MouseEvent {
         x: pos.x, y: pos.y,
-        delta_x: dx, delta_y: dy,
     });
 
     event

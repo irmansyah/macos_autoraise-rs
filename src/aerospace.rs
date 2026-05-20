@@ -59,57 +59,100 @@ impl AeroSpaceState {
     }
 
     /// Refresh floating window set from `aerospace list-windows`.
+    /// Uses two queries to find floating windows — compatible with all AeroSpace versions:
+    ///   1. Get ALL window IDs
+    ///   2. Get only TILED window IDs (those on real workspaces)
+    ///   3. Floating = All - Tiled
     pub fn refresh(&mut self) {
         self.last_refresh = Instant::now();
 
-        let output = Command::new("aerospace")
-            .args([
-                "list-windows",
-                "--all",
-                "--format",
-                // window-id is AeroSpace's internal ID; we also fetch the
-                // raw AX window ID via %{window-id} (same as what AXUI exposes).
-                "%{window-id}\t%{parent-container-layout}\t%{app-name}",
-            ])
-            .output();
+        // Query 1: all window IDs
+        let all = self.query_window_ids(&[
+            "list-windows", "--all",
+            "--format", "%{window-id}",
+        ]);
 
-        match output {
-            Ok(out) if out.status.success() => {
-                let text = String::from_utf8_lossy(&out.stdout);
-                let mut new_set = HashSet::new();
+        // Query 2: tiled window IDs (only windows in real workspaces, not floating)
+        let tiled = self.query_window_ids(&[
+            "list-windows", "--all",
+            "--format", "%{window-id}",
+            "--filter-tiling-windows",
+        ]);
 
-                for line in text.lines() {
-                    let parts: Vec<&str> = line.splitn(3, '\t').collect();
-                    if parts.len() < 2 { continue; }
-
-                    let id_str = parts[0].trim();
-                    let layout = parts[1].trim();
-                    let app = if parts.len() > 2 { parts[2].trim() } else { "" };
-
-                    if layout == "floating" {
-                        if let Ok(id) = id_str.parse::<u32>() {
-                            debug!("AeroSpace float: id={id} app={app}");
-                            new_set.insert(id);
-                        }
-                    }
-                }
-
-                debug!("AeroSpace: {} floating windows", new_set.len());
-                self.floating_window_ids = new_set;
+        // If --filter-tiling-windows isn't supported either, fall back to
+        // checking each window's workspace — floating windows show workspace "_"
+        let (all_ids, tiled_ids) = match (all, tiled) {
+            (Some(a), Some(t)) => (a, t),
+            (Some(a), None)    => {
+                // Fallback: use workspace query to find tiled windows
+                let tiled_fb = self.query_tiled_via_workspace();
+                (a, tiled_fb)
             }
-            Ok(out) => {
-                // AeroSpace returns non-zero when no windows exist — not a failure
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if !stderr.contains("no windows") {
-                    warn!("aerospace list-windows failed: {}", stderr.trim());
-                }
+            _ => {
+                warn!("AeroSpace queries failed — treating all windows as tiled");
                 self.floating_window_ids.clear();
+                return;
             }
-            Err(e) => {
-                warn!("Failed to run aerospace: {e}");
-                self.available = false;
+        };
+
+        // Floating = windows in all_ids but NOT in tiled_ids
+        let floating: HashSet<u32> = all_ids.difference(&tiled_ids).copied().collect();
+        debug!("AeroSpace: {} total, {} tiled, {} floating",
+            all_ids.len(), tiled_ids.len(), floating.len());
+        self.floating_window_ids = floating;
+    }
+
+    fn query_window_ids(&self, args: &[&str]) -> Option<HashSet<u32>> {
+        let out = Command::new("aerospace").args(args).output().ok()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // Unknown flag → return None so caller can fall back
+            if stderr.contains("Unknown") || stderr.contains("unrecognized") {
+                return None;
             }
         }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let ids = text.lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .collect();
+        Some(ids)
+    }
+
+    /// Fallback: get tiled window IDs by querying each real workspace.
+    /// Floating windows in AeroSpace don't belong to any named workspace.
+    fn query_tiled_via_workspace(&self) -> HashSet<u32> {
+        // Get list of workspace names
+        let ws_out = Command::new("aerospace")
+            .args(["list-workspaces", "--all"])
+            .output();
+        let ws_names = match ws_out {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+            }
+            _ => return HashSet::new(),
+        };
+
+        let mut tiled = HashSet::new();
+        for ws in &ws_names {
+            let out = Command::new("aerospace")
+                .args(["list-windows", "--workspace", ws, "--format", "%{window-id}"])
+                .output();
+            if let Ok(o) = out {
+                let text = String::from_utf8_lossy(&o.stdout);
+                for line in text.lines() {
+                    if let Ok(id) = line.trim().parse::<u32>() {
+                        tiled.insert(id);
+                    }
+                }
+            }
+        }
+        debug!("AeroSpace fallback: {} tiled window IDs across {} workspaces",
+            tiled.len(), ws_names.len());
+        tiled
     }
 
     /// Refresh if the refresh interval has elapsed.
@@ -119,18 +162,7 @@ impl AeroSpaceState {
         }
     }
 
-    /// Returns true if this window should be raised:
-    /// - AeroSpace not available → always raise
-    /// - Window is floating → raise
-    /// - Window is tiled → skip (AeroSpace handles tiled focus)
-    pub fn should_raise(&self, ax_window_id: u32) -> bool {
-        if !self.available {
-            return true; // AeroSpace not running, raise everything
-        }
-        self.floating_window_ids.contains(&ax_window_id)
-    }
-
-    /// Force an immediate refresh (e.g. after a layout change event).
+    /// Force refresh on next refresh_if_due call (e.g. after workspace change).
     pub fn invalidate(&mut self) {
         self.last_refresh = Instant::now() - self.refresh_interval - Duration::from_secs(1);
     }

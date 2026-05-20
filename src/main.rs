@@ -1,19 +1,11 @@
-// autoraise-rs — Focus-follows-mouse & auto-raise for macOS
-// Written in Rust using raw macOS Accessibility + CGEvent APIs.
-// AeroSpace-aware: tiled windows are EXCLUDED from auto-raise;
-// only floating windows (or non-AeroSpace windows) are raised.
-//
-// Build:  cargo build --release
-// Run:    ./target/release/autoraise-rs --help
-
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
 
 mod accessibility;
 mod aerospace;
+mod border;
 mod config;
 mod event_tap;
 mod raiser;
-mod border;
 
 use std::sync::{Arc, Mutex};
 use clap::Parser;
@@ -25,37 +17,37 @@ use raiser::Raiser;
 #[derive(Parser, Debug)]
 #[command(name = "autoraise-rs", about = "Focus-follows-mouse for macOS (AeroSpace-aware)", version)]
 struct Cli {
-    /// Poll interval in milliseconds (min 20)
-    #[arg(long, default_value_t = 50)]
-    poll_millis: u64,
+    /// Poll interval in milliseconds (min 20) — overrides config file
+    #[arg(long)]
+    poll_millis: Option<u64>,
 
-    /// Raise delay in poll ticks (0 = instant, 1 = no stop required, 2+ = must stop)
-    #[arg(long, default_value_t = 1)]
-    delay: u32,
+    /// Raise delay in ticks (0=off, 1=instant, 2+=stop required) — overrides config file
+    #[arg(long)]
+    delay: Option<u32>,
 
-    /// Comma-separated app names to ignore (e.g. "Finder,Activity Monitor")
-    #[arg(long, default_value = "")]
-    ignore_apps: String,
+    /// Comma-separated app names to ignore — appended to config file list
+    #[arg(long)]
+    ignore_apps: Option<String>,
 
-    /// Comma-separated window title substrings to ignore
-    #[arg(long, default_value = "")]
-    ignore_titles: String,
+    /// Comma-separated window title substrings to ignore — appended to config file list
+    #[arg(long)]
+    ignore_titles: Option<String>,
 
     /// Key that temporarily disables raising: control | option | disabled
-    #[arg(long, default_value = "control")]
-    disable_key: String,
+    #[arg(long)]
+    disable_key: Option<String>,
 
-    /// AeroSpace integration: skip tiled windows, only raise floating ones
-    #[arg(long, default_value_t = true)]
-    aerospace_aware: bool,
+    /// AeroSpace integration on/off — overrides config file
+    #[arg(long)]
+    aerospace_aware: Option<bool>,
 
-    /// How often (in poll cycles) to refresh AeroSpace floating-window list
-    #[arg(long, default_value_t = 10)]
-    aerospace_refresh_cycles: u32,
+    /// Poll cycles between AeroSpace refresh — overrides config file
+    #[arg(long)]
+    aerospace_refresh_cycles: Option<u32>,
 
-    /// Require mouse to stop moving before raising
-    #[arg(long, default_value_t = true)]
-    require_mouse_stop: bool,
+    /// Require mouse to stop before raising — overrides config file
+    #[arg(long)]
+    require_mouse_stop: Option<bool>,
 
     /// Verbose logging
     #[arg(long, default_value_t = false)]
@@ -65,25 +57,51 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    // Set up logging
     let log_level = if cli.verbose { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(log_level)
+    ).init();
 
-    // Merge CLI + config file (~/.config/autoraise-rs/config.toml)
+    // Load config file first, then selectively override with CLI args
     let mut cfg = Config::load_or_default();
-    cfg.apply_cli(&cli);
+
+    // Only override fields that were explicitly passed on the CLI
+    if let Some(v) = cli.poll_millis            { cfg.poll_millis = v.max(20); }
+    if let Some(v) = cli.delay                  { cfg.delay = v; }
+    if let Some(v) = cli.disable_key            { cfg.disable_key = v; }
+    if let Some(v) = cli.require_mouse_stop     { cfg.require_mouse_stop = v; }
+    if let Some(v) = cli.aerospace_aware        { cfg.aerospace_aware = v; }
+    if let Some(v) = cli.aerospace_refresh_cycles { cfg.aerospace_refresh_cycles = v; }
+
+    // Ignore lists: CLI additions are appended to file config
+    if let Some(apps) = cli.ignore_apps {
+        let extra: Vec<String> = apps
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        cfg.ignore_apps.extend(extra);
+    }
+    if let Some(titles) = cli.ignore_titles {
+        let extra: Vec<String> = titles
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        cfg.ignore_titles.extend(extra);
+    }
 
     info!("autoraise-rs starting");
-    info!("  poll_millis:         {}ms", cfg.poll_millis);
+    info!("  poll_millis:         {}ms",  cfg.poll_millis);
     info!("  delay:               {} ticks", cfg.delay);
-    info!("  require_mouse_stop:  {}", cfg.require_mouse_stop);
-    info!("  aerospace_aware:     {}", cfg.aerospace_aware);
-    info!("  disable_key:         {}", cfg.disable_key);
+    info!("  require_mouse_stop:  {}",    cfg.require_mouse_stop);
+    info!("  aerospace_aware:     {}",    cfg.aerospace_aware);
+    info!("  disable_key:         {}",    cfg.disable_key);
+    info!("  show_border:         {}",    cfg.show_border);
     if !cfg.ignore_apps.is_empty() {
         info!("  ignore_apps:         {:?}", cfg.ignore_apps);
     }
 
-    // Check Accessibility permissions
     if !accessibility::is_trusted() {
         warn!("Accessibility permissions NOT granted!");
         warn!("Open: System Settings → Privacy & Security → Accessibility");
@@ -94,5 +112,5 @@ fn main() {
 
     let config = Arc::new(Mutex::new(cfg));
     let raiser = Raiser::new(config.clone());
-    raiser.run() // -> ! blocks forever on CFRunLoopRun()
+    raiser.run()
 }

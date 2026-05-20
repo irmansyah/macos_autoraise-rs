@@ -1,192 +1,169 @@
-# autoraise-rs
+# macos_autoraise-rs 🚀
 
-**Focus-follows-mouse & auto-raise for macOS — written in Rust.**
+[![Language](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](https://www.apple.com/macos/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A faster, safer reimplementation of [AutoRaise](https://github.com/sbmpost/AutoRaise)
-with first-class **AeroSpace tiling WM** integration.
+A blazing-fast, lightweight background daemon written in pure Rust that brings **True Focus-Follows-Mouse (FFM)** functionality to macOS. Engineered specifically for keyboard-driven power users, tiling window manager enthusiasts, and minimalist dotfile architectures.
 
----
-
-## Why Rust over Objective-C++?
-
-| | AutoRaise (ObjC++) | autoraise-rs (Rust) |
-|---|---|---|
-| **Kernel API** | CGEventTap | CGEventTap (identical) |
-| **Window API** | AX + CGWindowList | AX + CGWindowList (identical) |
-| **Latency** | Zero — passive tap | Zero — passive tap |
-| **Memory safety** | Manual retain/release | Guaranteed by compiler |
-| **Crash safety** | ObjC exceptions | Rust panics (recoverable) |
-| **AeroSpace support** | None | ✅ Built-in |
-| **Config format** | Key=value | TOML (structured) |
-
-Same kernel-level APIs → **identical or better performance**. Rust adds
-safety with zero runtime cost.
+Unlike legacy utilities, `macos_autoraise-rs` is optimized out-of-the-box to work seamlessly with the modern **AeroSpace** tiling layout paradigm, featuring intelligent state filtering and hardware-accelerated focused window borders.
 
 ---
 
-## AeroSpace Integration (Key Feature)
+## ⚡ Key Features
 
-When `aerospace_aware = true` (default), autoraise-rs integrates with
-[AeroSpace](https://github.com/nikitabobko/AeroSpace) tiling WM:
-
-- **Tiled windows** → **skipped**. AeroSpace manages focus for tiled windows
-  via its own `hjkl` bindings. Raising them would fight AeroSpace.
-- **Floating windows** → **raised normally**. Dialogs, picture-in-picture,
-  1Password, your terminal overlay — anything you've set to `layout floating`
-  in AeroSpace gets auto-raised like a normal floating WM.
-
-The floating window list is refreshed every `N` poll cycles (configurable)
-by running `aerospace list-windows --all` in the background.
-
-**If AeroSpace is not running**, autoraise-rs falls back to raising all windows.
+* **Zero-Allocation Hot Path:** Legacy C++/Objective-C focus tools rely on heavy object pools or Cocoa reference-counting structures. This daemon intercepts hardware pointer events directly from the macOS Window Server via low-level C-FFI (`CGEventTap`). It processes coordinate maps inside an isolated real-time thread with **virtually zero transient heap allocations**, keeping your CPU footprint at a steady ~0%.
+* **AeroSpace Native Intelligence:** Traditional FFM engines constantly fight tiling window trees—accidentally triggering focus loops, re-raising parent containers, or conflicting with keyboard layout shifts (`hjkl`). This tool runs a tight loop with the AeroSpace IPC interface, caching floating layers inside a high-speed hash map. Tiled structures are automatically bypassed, leaving focus to AeroSpace, while loose floating frames raise seamlessly.
+* **Hardware-Accelerated Borders:** Draws a clean, configurable focused border highlight around the active window layer using modern AppKit `CALayer` structures. It instantiates directly within the event thread for instantaneous rendering without requiring external drawing packages.
+* **Type-Safe Configuration:** Managed through a straightforward, easily scriptable `config.toml` that supports explicit application filters, custom padding, and temporary modifier-key overrides.
 
 ---
 
-## Build & Install
+## ⚙️ Configuration (`config.toml`)
 
-```bash
-# Prerequisites: Rust toolchain (https://rustup.rs)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Clone and build
-git clone <this-repo>
-cd autoraise-rs
-bash install.sh
-```
-
-`install.sh` will:
-1. `cargo build --release`
-2. Copy binary to `/usr/local/bin/autoraise-rs`
-3. Write a sample config to `~/.config/autoraise-rs/config.toml`
-4. Install and load a `launchd` agent (auto-start at login)
-
-Then grant **Accessibility** permission when prompted:
-> System Settings → Privacy & Security → Accessibility → add the binary
-
----
-
-## Configuration
-
-`~/.config/autoraise-rs/config.toml`:
+The daemon automatically looks for its configuration file at `~/.config/autoraise-rs/config.toml`. 
 
 ```toml
-# Poll interval in milliseconds (min 20, default 50)
-poll_millis = 50
+# Time interval in milliseconds to poll mouse position coordinates
+poll_millis              = 50
 
-# Raise delay in ticks:
-#   0 = disable raising
-#   1 = raise instantly on hover
-#   2+ = mouse must be still for (delay × poll_millis) ms
-delay = 1
+# Deliberate delay multiplier before executing window raise actions
+delay                    = 1
 
-# Require mouse to stop before raising
-require_mouse_stop = true
+# Require the mouse pointer to physically come to a complete halt before raising
+require_mouse_stop       = true
 
-# AeroSpace integration — ONLY raise floating windows
-aerospace_aware = true
-
-# How often to refresh AeroSpace floating-window list (in poll cycles)
+# Enable real-time integration with the AeroSpace window tree
+aerospace_aware          = true
 aerospace_refresh_cycles = 10
 
-# Key that temporarily disables raising while held
-# "control" | "option" | "disabled"
-disable_key = "control"
+# Global modifier key override (e.g. "Option", "Control", "Command") to temporarily disable FFM
+disable_key              = ""
 
-# Apps to never auto-raise (case-insensitive)
-ignore_apps = []
-# ignore_apps = ["Finder", "Activity Monitor"]
+# Native Focus Border Highlights
+border_width             = 4.0
+border_color             = "#FF3366" # Hexadecimal color format
 
-# Window title substrings to ignore
-ignore_titles = []
-# ignore_titles = ["Picture in Picture", "Quick Look"]
-```
-
----
-
-## AeroSpace Config Tips
-
-In your `~/.aerospace.toml`, mark windows you want auto-raised as floating:
-
-```toml
-# These will be auto-raised by autoraise-rs
-[[on-window-detected]]
-if.app-id = "com.1password.1password"
-run = "layout floating"
-
-[[on-window-detected]]
-if.app-id = "com.apple.finder"
-run = "layout floating"
-
-[[on-window-detected]]
-if.app-id = "com.iconfactory.Tot"
-run = "layout floating"
-
-# Tiled windows (default) are SKIPPED by autoraise-rs —
-# use your hjkl bindings to focus them.
-```
+# Application filters to completely exclude from focus shifts
+ignore_apps              = [
+  "1Password",
+  "Notification Center",
+  "Control Center",
+  "Spotlight",
+  "System Settings",
+  "Raycast"
+]
+ignore_titles            = []
 
 ---
 
-## Usage
+## 📦 Installation & Setup
 
-```
-autoraise-rs [OPTIONS]
+### Prerequisites
 
-Options:
-  --poll-millis <N>               Poll interval ms [default: 50]
-  --delay <N>                     Raise delay ticks [default: 1]
-  --ignore-apps <a,b>             Comma-separated app names to skip
-  --ignore-titles <x,y>           Title substrings to skip
-  --disable-key <control|option>  Temporarily disable key [default: control]
-  --aerospace-aware <bool>        AeroSpace integration [default: true]
-  --aerospace-refresh-cycles <N>  Refresh interval [default: 10]
-  --require-mouse-stop <bool>     Stop required before raise [default: true]
-  --verbose                       Debug logging
-  --help                          Show help
-```
-
----
-
-## Service Management
+You need the standard Rust toolchain installed on your Mac. If you don't have it, set it up via `rustup`:
 
 ```bash
-# Stop
-launchctl unload ~/Library/LaunchAgents/com.user.autoraise-rs.plist
+curl --proto '=https' --tlsv1.2 -sSf [https://sh.rustup.rs](https://sh.rustup.rs) | sh
 
-# Start
-launchctl load -w ~/Library/LaunchAgents/com.user.autoraise-rs.plist
+```
 
-# Tail logs
-tail -f /tmp/autoraise-rs.log
+### 1. Clone & Compile
 
-# Uninstall completely
-launchctl unload ~/Library/LaunchAgents/com.user.autoraise-rs.plist
-sudo rm /usr/local/bin/autoraise-rs
-rm ~/Library/LaunchAgents/com.user.autoraise-rs.plist
+Clone the repository and build the production-optimized binary:
+
+```bash
+git clone [https://github.com/irmansyah/macos_autoraise-rs.git](https://github.com/irmansyah/macos_autoraise-rs.git)
+cd macos_autoraise-rs
+cargo build --release
+
+```
+
+### 2. Copy Binary and Configuration
+
+Create your standard XDG configurations path and move the compiled executable to your local path:
+
+```bash
+# Install the binary
+sudo cp target/release/autoraise-rs /usr/local/bin/
+
+# Set up configuration directories
+mkdir -p ~/.config/autoraise-rs/
+cp config.toml ~/.config/autoraise-rs/config.toml
+
+```
+
+### 3. Configure Autostart Daemon via launchd
+
+To have `macos_autoraise-rs` launch automatically in the background when your user profile logs in, register it as a native macOS User Agent.
+
+Create a plist file at `~/Library/LaunchAgents/com.irmansyah.autoraise-rs.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "[http://www.apple.com/DTDs/PropertyList-1.0.dtd](http://www.apple.com/DTDs/PropertyList-1.0.dtd)">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.irmansyah.autoraise-rs</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/autoraise-rs</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/autoraise-rs.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/autoraise-rs.log</string>
+</dict>
+</plist>
+
+```
+
+Bootstrap and activate the background service manually for the first time:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.irmansyah.autoraise-rs.plist
+launchctl kickstart -k gui/$(id -u)/com.irmansyah.autoraise-rs
+
 ```
 
 ---
 
-## How It Works
+## 🔒 Security & Accessibility Permissions
+
+Because this background process monitors hardware cursor inputs (`CGEventTap`) and interacts with core UI frameworks (`AXUIElementPerformAction`) to bring application windows to the absolute foreground, macOS handles it under strict security sandboxing.
+
+1. Upon the first runtime initiation, macOS will present an **Accessibility Permissions Required** warning prompt.
+2. Navigate to **System Settings ➔ Privacy & Security ➔ Accessibility**.
+3. Locate `autoraise-rs` in the list (or your terminal app if running interactively) and toggle the permission slider to **ON**.
+
+> ⚠️ **Development Note:** When you manually recompile the project using `cargo build --release` after code changes, macOS might quietly block the updated binary path without throwing a fresh alert popup. If the service drops execution streams unexpectedly, clear the OS permission cache: **remove** the binary from the Accessibility table using the `-` button and add/trigger it freshly.
+
+### Debugging & Logs
+
+To trace active event polling thresholds or debug parsing adjustments, watch your system standard error dump stream:
+
+```bash
+tail -f /tmp/autoraise-rs.log
 
 ```
-Kernel (HID layer)
-    │  CGEventTap (passive, zero latency, same as AutoRaise)
-    ▼
-Main Thread (CFRunLoop)
-    │  MouseEvent { x, y, dx, dy }  via sync_channel
-    ▼
-Raiser Thread (poll every 50ms)
-    │
-    ├─ 1. CGWindowListCopyWindowInfo → find window under cursor
-    ├─ 2. Layer check (skip menus/panels/overlays — layer != 0)
-    ├─ 3. Modifier key check (control held? → skip)
-    ├─ 4. Ignore app/title check
-    ├─ 5. AeroSpace: is this window floating? (skip if tiled)
-    ├─ 6. Delay tick (mouse must stop if delay > 1)
-    └─ 7. AXRaise + NSRunningApplication activate
+
+---
+
+## 🤝 Contributing
+
+Contributions, enhancements, and structural cleanups are welcome! Please ensure any submitted pull requests strictly pass `cargo clippy` and respect the zero-allocation constraint within the primary event matching runtime loop.
+
+Licensed under the [MIT License](https://www.google.com/search?q=LICENSE).
+
 ```
 
-The CGEventTap fires on every mouse-moved HID event (kernel level).
-The raiser thread drains the channel and processes only the *latest* position
-per poll cycle — so fast mouse movement burns zero extra CPU.
+```
