@@ -1,31 +1,10 @@
 // accessibility.rs — macOS Accessibility API wrappers
 
-use core_foundation::array::CFArrayRef;
 use core_foundation::base::{CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
-use core_graphics::window::CGWindowID;
+use log::debug;
 
 // ── Raw C bindings ────────────────────────────────────────────────────────────
-
-// unsafe fn do_raise(pid: i32, window_id: u32) {
-//     // Modify your accessibility function call to accept the specific window_id
-//     // This tells AXUIElement to perform AXPerformAction(window_ref, kAXRaiseAction)
-//     accessibility::raise_app_window(pid, Some(window_id));
-//
-//     // Activate the application WITHOUT bringing all windows forward
-//     let cls = match Class::get("NSRunningApplication") {
-//         Some(c) => c,
-//         None    => return,
-//     };
-//     let app: *mut Object = msg_send![cls,
-//         runningApplicationWithProcessIdentifier: pid as i32
-//     ];
-//     if !app.is_null() {
-//         // Option 1u64 is NSApplicationActivateIgnoringOtherApps
-//         // This brings the process focus up without shifting internal window orders natively
-//         let _: bool = msg_send![app, activateWithOptions: 1u64];
-//     }
-// }
 
 #[allow(improper_ctypes)]
 extern "C" {
@@ -97,39 +76,99 @@ pub fn set_windows_floating(app_elem: AXUIElementRef) {
     }
 }
 
-/// Raise the frontmost window of the given PID.
-pub unsafe fn raise_app_window(pid: i32, target_window_id: Option<u32>) {
-    // 1. Get AXUIElement for the application
-    let app_ref = AXUIElementCreateApplication(pid);
-    if app_ref.is_null() { return; }
+/// Raise a specific window of the given PID by matching its CGWindowID.
+/// If window_ax_id_hint is None, raises the first window on the current space.
+/// This avoids pulling windows from other spaces/monitors.
+pub fn raise_app_window(pid: i32, window_ax_id_hint: Option<u32>) -> Option<u32> {
+    unsafe {
+        let app_elem = AXUIElementCreateApplication(pid as libc::pid_t);
+        if app_elem.is_null() { return None; }
 
-    // 2. Get copy of window list attribute
-    let mut values: CFArrayRef = std::ptr::null();
-    let err = AXUIElementCopyAttributeValue(app_ref, CFString::new("AXWindows").as_concrete_TypeRef(), &mut values as *mut _ as *mut _);
-    
-    if err == 0 && !values.is_null() {
-        let count = CFArrayGetCount(values as CFTypeRef);
+        // Get ALL windows for this app, not just the focused one.
+        // The focused window might be on a different space/monitor.
+        let wins_attr = CFString::new(kAXWindowsAttribute);
+        let mut wins_val: CFTypeRef = std::ptr::null_mut();
+        let err = AXUIElementCopyAttributeValue(
+            app_elem,
+            wins_attr.as_concrete_TypeRef(),
+            &mut wins_val,
+        );
+
+        if err != kAXErrorSuccess || wins_val.is_null() {
+            // Fallback: raise focused window
+            CFRelease(app_elem as CFTypeRef);
+            return raise_focused_window(pid, window_ax_id_hint);
+        }
+
+        let count = CFArrayGetCount(wins_val);
+        let raise_action = CFString::new(kAXRaiseAction);
+        let mut raised_wid: Option<u32> = None;
+
         for i in 0..count {
-            let win_element = CFArrayGetValueAtIndex(values as CFTypeRef, i) as AXUIElementRef;
-            if win_element.is_null() { continue; }
+            let win = CFArrayGetValueAtIndex(wins_val, i) as AXUIElementRef;
+            if win.is_null() { continue; }
 
-            if let Some(target_id) = target_window_id {
-                // Fetch the unique AX ID of this window element
-                let mut cgid: CGWindowID = 0;
-                let _ = _AXUIElementGetWindow(win_element, &mut cgid);
-                
-                if cgid != target_id {
-                    continue; // Skip windows that aren't the one under the cursor
-                }
+            let mut wid: u32 = 0;
+            _AXUIElementGetWindow(win, &mut wid);
+
+            // If caller gave a hint, only raise the matching window
+            if let Some(hint) = window_ax_id_hint {
+                if wid != hint { continue; }
             }
 
-            // Perform the raise action on the exact matching window
-            AXUIElementPerformAction(win_element, CFString::new("AXRaise").as_concrete_TypeRef());
-            break;
+            let raise_err = AXUIElementPerformAction(win, raise_action.as_concrete_TypeRef());
+            if raise_err == kAXErrorSuccess {
+                debug!("AXRaise succeeded for pid={pid} wid={wid}");
+                raised_wid = Some(wid);
+                break; // Found and raised the right window
+            }
         }
-        CFRelease(values as CFTypeRef);
+
+        CFRelease(wins_val);
+        CFRelease(app_elem as CFTypeRef);
+        raised_wid
     }
-    CFRelease(app_ref as CFTypeRef);
+}
+
+/// Fallback: raise the app's currently focused window.
+fn raise_focused_window(pid: i32, window_ax_id_hint: Option<u32>) -> Option<u32> {
+    unsafe {
+        let app_elem = AXUIElementCreateApplication(pid as libc::pid_t);
+        if app_elem.is_null() { return None; }
+
+        let win = match get_focused_window(app_elem) {
+            Some(w) => w,
+            None => { CFRelease(app_elem as CFTypeRef); return None; }
+        };
+
+        let mut wid: u32 = 0;
+        let id_err = _AXUIElementGetWindow(win, &mut wid);
+
+        if let Some(hint) = window_ax_id_hint {
+            if id_err == kAXErrorSuccess && wid != 0 && wid != hint {
+                CFRelease(win as CFTypeRef);
+                CFRelease(app_elem as CFTypeRef);
+                return None;
+            }
+        }
+
+        let raise_action = CFString::new(kAXRaiseAction);
+        let raise_err = AXUIElementPerformAction(win, raise_action.as_concrete_TypeRef());
+
+        if raise_err != kAXErrorSuccess {
+            let main_attr = CFString::new(kAXMainAttribute);
+            let cf_true   = core_foundation::boolean::CFBoolean::true_value();
+            AXUIElementSetAttributeValue(
+                win,
+                main_attr.as_concrete_TypeRef(),
+                cf_true.as_CFTypeRef(),
+            );
+        }
+
+        CFRelease(win as CFTypeRef);
+        CFRelease(app_elem as CFTypeRef);
+        if wid != 0 { Some(wid) } else { None }
+    }
 }
 
 /// Get the window title of the frontmost window for a PID.

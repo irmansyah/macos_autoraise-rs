@@ -3,7 +3,6 @@
 #![allow(non_upper_case_globals, non_snake_case, unexpected_cfgs)]
 
 use std::sync::{Arc, Mutex};
-use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
 use log::{debug, info, warn};
@@ -42,25 +41,39 @@ const kCGEventFlagMaskControl:   u64 = 0x0004_0000;
 
 use dispatch::Queue;
 use objc::runtime::{Class, Object};
+use objc::{msg_send, sel, sel_impl};
 
 // ── CGWindow dict keys ────────────────────────────────────────────────────────
 
 const kCGWindowOwnerPID:  &str = "kCGWindowOwnerPID";
-const kCGWindowNumber:    &str = "kCGWindowNumber"; // Required for mapping AX IDs to PIDs
+const kCGWindowNumber:    &str = "kCGWindowNumber";
 const kCGWindowLayer:     &str = "kCGWindowLayer";
 const kCGWindowBounds:    &str = "kCGWindowBounds";
 const kCGWindowOwnerName: &str = "kCGWindowOwnerName";
 
+// ── Public Raiser ─────────────────────────────────────────────────────────────
+
+pub struct Raiser {
+    config: Arc<Mutex<Config>>,
+}
+
 // ── Context-change notification ───────────────────────────────────────────────
+// We listen on a Unix domain socket at ~/.cache/autoraise-rs/notify.sock.
+// AeroSpace's exec-on-workspace-change fires:
+//   echo -n x | nc -U ~/.cache/autoraise-rs/notify.sock
+// CGDisplayRegisterReconfigurationCallback fires on monitor plug/unplug.
+// Both instantly call context_changed() → hide border + reset raise state.
 
 use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
 
 static CONTEXT_CHANGED: AtomicBool = AtomicBool::new(false);
 
+/// Called from socket thread or CGDisplay callback — signals the raiser thread.
 fn signal_context_changed() {
     CONTEXT_CHANGED.store(true, AOrdering::Relaxed);
 }
 
+/// Spawn a thread that listens on the Unix socket for workspace-change signals.
 fn spawn_socket_listener() {
     use std::os::unix::net::UnixListener;
     use std::io::Read;
@@ -70,7 +83,7 @@ fn spawn_socket_listener() {
     let sock = dir.join("notify.sock");
 
     std::fs::create_dir_all(&dir).ok();
-    std::fs::remove_file(&sock).ok(); 
+    std::fs::remove_file(&sock).ok(); // remove stale socket from last run
 
     thread::spawn(move || {
         let listener = match UnixListener::bind(&sock) {
@@ -91,6 +104,7 @@ fn spawn_socket_listener() {
     });
 }
 
+/// Register a CGDisplay reconfiguration callback for monitor plug/unplug.
 fn register_display_callback() {
     extern "C" {
         fn CGDisplayRegisterReconfigurationCallback(
@@ -105,12 +119,6 @@ fn register_display_callback() {
     unsafe { CGDisplayRegisterReconfigurationCallback(on_display_change, std::ptr::null_mut()); }
 }
 
-// ── Public Raiser ─────────────────────────────────────────────────────────────
-
-pub struct Raiser {
-    config: Arc<Mutex<Config>>,
-}
-
 impl Raiser {
     pub fn new(config: Arc<Mutex<Config>>) -> Self {
         Self { config }
@@ -123,12 +131,13 @@ impl Raiser {
         let aerospace_aware  = cfg.aerospace_aware;
         drop(cfg);
 
+        // Start instant workspace/monitor change listeners
         spawn_socket_listener();
         register_display_callback();
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<MouseEvent>(64);
+
         let config_clone = self.config.clone();
-        
         thread::spawn(move || {
             let mut state = RaiserState::new(
                 config_clone,
@@ -137,31 +146,18 @@ impl Raiser {
                 poll_millis,
             );
             loop {
-                // ── Workspace Change Handler ──
+                // Check for instant context-change signal first
                 if CONTEXT_CHANGED.swap(false, AOrdering::Relaxed) {
                     debug!("context changed — hiding border, resetting raise state");
-                    state.raised_window_id = None;
-                    state.last_window_id   = None;
-                    state.still_ticks      = 0;
-                    
+                    state.raised_pid      = None;
+                    state.last_window_pid = None;
                     let cfg_c = state.config.lock().unwrap().clone();
                     if cfg_c.show_border {
                         Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
                     }
-                    
-                    // Force refresh and enforce floating layer on new workspace
+                    // Also force AeroSpace floating list refresh
                     if let Some(ref mut s) = state.aerospace {
                         s.invalidate();
-                        s.refresh_if_due(); 
-                        
-                        let floating_ax_ids = s.floating_window_ids.clone();
-                        let pids = get_visible_floating_pids(&floating_ax_ids);
-                        
-                        Queue::main().exec_async(move || unsafe {
-                            for pid in pids {
-                                pin_floating_on_top_sync(pid);
-                            }
-                        });
                     }
                 }
 
@@ -187,11 +183,11 @@ impl Raiser {
 struct RaiserState {
     config: Arc<Mutex<Config>>,
     aerospace: Option<AeroSpaceState>,
-    last_window_id: Option<u32>,
+    last_window_pid: Option<i32>,
     still_ticks: u32,
     last_x: f64,
     last_y: f64,
-    raised_window_id: Option<u32>,
+    raised_pid: Option<i32>,
     aerospace_cycle_counter: u32,
     aerospace_refresh_cycles: u32,
 }
@@ -211,11 +207,11 @@ impl RaiserState {
         Self {
             config,
             aerospace,
-            last_window_id: None,
+            last_window_pid: None,
             still_ticks: 0,
             last_x: -9999.0,
             last_y: -9999.0,
-            raised_window_id: None,
+            raised_pid: None,
             aerospace_cycle_counter: 0,
             aerospace_refresh_cycles: aerospace_cycles,
         }
@@ -227,6 +223,7 @@ impl RaiserState {
         self.last_x = x;
         self.last_y = y;
 
+        // Periodic AeroSpace refresh
         self.aerospace_cycle_counter += 1;
         if self.aerospace_cycle_counter >= self.aerospace_refresh_cycles {
             self.aerospace_cycle_counter = 0;
@@ -237,17 +234,21 @@ impl RaiserState {
 
         let cfg = self.config.lock().unwrap().clone();
 
+        // 1. Modifier key disable
         if self.modifier_key_held(&cfg.disable_key) {
             debug!("modifier held — skip");
             return;
         }
 
+        // 2. Find window under cursor
         let win = match window_at_point(x, y) {
             Some(w) => w,
             None => {
-                self.last_window_id = None;
-                self.raised_window_id = None;
+                debug!("no window at ({x:.0},{y:.0})");
+                self.last_window_pid = None;
+                self.raised_pid = None;
                 self.still_ticks = 0;
+                // Hide border when mouse is over no window
                 if cfg.show_border {
                     Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
                 }
@@ -255,25 +256,35 @@ impl RaiserState {
             }
         };
 
+        debug!("at ({x:.0},{y:.0}): app='{}' pid={} layer={}", win.app_name, win.pid, win.layer);
+
+        // 3. Skip true system UI layers (menus=25, dock=20, screensaver=1000, etc.)
+        // Normal windows = 0, AeroSpace floating windows may be 0 or 3 (NSFloatingWindowLevel)
+        // We allow layers 0..=5 through; anything higher is system UI we don't touch.
         if win.layer > 5 {
+            debug!("  → skip system layer {}", win.layer);
             return;
         }
 
+        // 4. Ignore app list
         let app_lower = win.app_name.to_lowercase();
         if cfg.ignore_apps.iter().any(|a| a.to_lowercase() == app_lower) {
+            debug!("  → ignored app '{}'", win.app_name);
             return;
         }
 
+        // 5. Ignore title list
         if !cfg.ignore_titles.is_empty() {
             if let Some(title) = accessibility::get_window_title(win.pid) {
                 let tl = title.to_lowercase();
                 if cfg.ignore_titles.iter().any(|t| tl.contains(&t.to_lowercase())) {
+                    debug!("  → ignored title '{title}'");
                     return;
                 }
             }
         }
 
-        // ── AeroSpace awareness ──
+        // 6. AeroSpace awareness
         if let Some(ref as_state) = self.aerospace {
             if as_state.available {
                 if let Some(ax_id) = accessibility::get_ax_window_id(win.pid) {
@@ -283,8 +294,8 @@ impl RaiserState {
                         debug!("  → floating: no raise, draw border only (bounds={:?})", win.bounds);
                         pin_floating_on_top(win.pid);
 
-                        let new_float = self.last_window_id != Some(win.window_id);
-                        self.last_window_id = Some(win.window_id);
+                        let new_float = self.last_window_pid != Some(win.pid);
+                        self.last_window_pid = Some(win.pid);
 
                         if new_float && cfg.show_border {
                             let bounds = win.bounds;
@@ -299,42 +310,45 @@ impl RaiserState {
                         }
                         return;
                     }
+
+                    // Tiled window → fall through to raise logic below
+                    debug!("  → tiled: will raise on hover");
                 }
             }
         }
 
-        // Detect window change
-        let new_window = self.last_window_id != Some(win.window_id);
+        // 7. Detect window change
+        let new_window = self.last_window_pid != Some(win.pid);
         if new_window {
-            debug!("  → new window instance detected, resetting state");
+            debug!("  → new window, resetting state");
             self.still_ticks = 0;
-            self.raised_window_id = None;
+            self.raised_pid  = None;
         }
-        self.last_window_id = Some(win.window_id);
+        self.last_window_pid = Some(win.pid);
 
         if moved { self.still_ticks = 0; } else { self.still_ticks += 1; }
 
-        // Already raised this specific window?
-        if self.raised_window_id == Some(win.window_id) { return; }
+        // 8. Already raised this window?
+        if self.raised_pid == Some(win.pid) { return; }
 
-        // Delay gate
+        // 9. Delay gate
         let delay = cfg.delay;
         if delay == 0 { return; }
         if delay > 1 && cfg.require_mouse_stop && self.still_ticks < delay {
+            debug!("  → waiting ({}/{})", self.still_ticks, delay);
             return;
         }
 
-        // Raise specific window instance
-        debug!("  → RAISING Window {} of '{}' pid={}", win.window_id, win.app_name, win.pid);
-        self.raised_window_id = Some(win.window_id);
-        
-        let bounds = win.bounds;
-        let show_border = cfg.show_border;
-        let bwidth = cfg.border_width;
-        let bcolor = cfg.border_color.clone();
-        let floating_ax_ids = self.aerospace.as_ref().map(|s| s.floating_window_ids.clone()).unwrap_or_default();
+        // 10. Raise
+        debug!("  → RAISING '{}' pid={} wid={}", win.app_name, win.pid, win.window_id);
+        self.raised_pid = Some(win.pid);
 
-        raise_tiling_and_enforce_floating(win.pid, win.window_id, bounds, show_border, bwidth, bcolor, floating_ax_ids);
+        let bounds      = win.bounds;
+        let window_id   = win.window_id;
+        let show_border = cfg.show_border;
+        let bwidth      = cfg.border_width;
+        let bcolor      = cfg.border_color.clone();
+        raise_on_main_thread(win.pid, window_id, bounds, show_border, bwidth, bcolor);
     }
 
     fn modifier_key_held(&self, key: &str) -> bool {
@@ -350,83 +364,46 @@ impl RaiserState {
     }
 }
 
-// ── Workspace / layer enforcement helpers ─────────────────────────────────────
+// ── Workspace / monitor helpers ───────────────────────────────────────────────
 
-fn get_visible_floating_pids(floating_ax_ids: &HashSet<u32>) -> Vec<i32> {
-    let mut pids = Vec::new();
-    if floating_ax_ids.is_empty() { return pids; }
-
-    unsafe {
-        let list = CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-            kCGNullWindowID,
-        );
-        if list.is_null() { return pids; }
-
-        let count = CFArrayGetCount(list as CFTypeRef);
-        for i in 0..count {
-            let dict_ptr = CFArrayGetValueAtIndex(list as CFTypeRef, i) as CFDictionaryRef;
-            if dict_ptr.is_null() { continue; }
-
-            let ax_id = get_dict_int(dict_ptr, kCGWindowNumber).unwrap_or(0) as u32;
-            if floating_ax_ids.contains(&ax_id) {
-                if let Some(pid) = get_dict_int(dict_ptr, kCGWindowOwnerPID) {
-                    let p = pid as i32;
-                    if !pids.contains(&p) {
-                        pids.push(p);
-                    }
-                }
-            }
-        }
-        CFRelease(list as CFTypeRef);
-    }
-    pids
-}
+// ── Pin floating window above tiled layer ─────────────────────────────────────
+// Sets NSWindowLevel to floating (3) so it always renders above normal (0) windows.
+// Called every time mouse enters a floating window — idempotent, cheap.
 
 fn pin_floating_on_top(pid: i32) {
-    Queue::main().exec_async(move || unsafe {
-        pin_floating_on_top_sync(pid);
+    Queue::main().exec_async(move || {
+        unsafe {
+            let cls = match Class::get("NSRunningApplication") {
+                Some(c) => c,
+                None    => return,
+            };
+            let app: *mut Object = msg_send![cls,
+                runningApplicationWithProcessIdentifier: pid as i32
+            ];
+            if app.is_null() { return; }
+
+            // Get all windows for this app via AX and set their level
+            let ax_app = crate::accessibility::ax_app_element(pid);
+            if ax_app.is_null() { return; }
+
+            crate::accessibility::set_windows_floating(ax_app);
+        }
     });
 }
 
-unsafe fn pin_floating_on_top_sync(pid: i32) {
-    use objc::{msg_send, sel, sel_impl};
-    let cls = match Class::get("NSRunningApplication") {
-        Some(c) => c,
-        None    => return,
-    };
-    let app: *mut Object = msg_send![cls,
-        runningApplicationWithProcessIdentifier: pid
-    ];
-    if app.is_null() { return; }
+// ── Raise tiled window on main thread ────────────────────────────────────────
 
-    let ax_app = crate::accessibility::ax_app_element(pid);
-    if ax_app.is_null() { return; }
-
-    crate::accessibility::set_windows_floating(ax_app);
-}
-
-fn raise_tiling_and_enforce_floating(
-    tiled_pid: i32,
-    tiled_window_id: u32,
+fn raise_on_main_thread(
+    pid: i32,
+    window_id: u32,
     bounds: (f64, f64, f64, f64),
     show_border: bool,
     border_width: f64,
     border_color: String,
-    floating_ax_ids: HashSet<u32>
 ) {
-    let floating_pids = get_visible_floating_pids(&floating_ax_ids);
-
     Queue::main().exec_async(move || {
         unsafe {
-            // 1. Bring the exact single window instance to front
-            do_raise(tiled_pid, tiled_window_id);
-            
-            // 2. Re-assert floating layers
-            for pid in floating_pids {
-                pin_floating_on_top_sync(pid);
-            }
-
+            do_raise(pid, window_id);
             if show_border {
                 crate::border::update_border(
                     bounds.0, bounds.1, bounds.2, bounds.3,
@@ -438,24 +415,25 @@ fn raise_tiling_and_enforce_floating(
 }
 
 unsafe fn do_raise(pid: i32, window_id: u32) {
-    // Structural AXRaiseAction target
+    // Raise the EXACT window by CGWindowID — prevents pulling windows from other spaces
     accessibility::raise_app_window(pid, Some(window_id));
 
-    use objc::{msg_send, sel, sel_impl};
+    // NSApplicationActivateAllWindows (1) = only activate windows on CURRENT space
+    // Does NOT switch spaces or pull windows from other monitors
     let cls = match Class::get("NSRunningApplication") {
         Some(c) => c,
         None    => return,
     };
     let app: *mut Object = msg_send![cls,
-        runningApplicationWithProcessIdentifier: pid
+        runningApplicationWithProcessIdentifier: pid as i32
     ];
     if !app.is_null() {
-        // Option 1u64: NSApplicationActivateIgnoringOtherApps (Leaves window layout weights intact)
         let _: bool = msg_send![app, activateWithOptions: 1u64];
     }
 }
 
 // ── CoreFoundation Raw FFI ────────────────────────────────────────────────────
+// CFArray uses CFTypeRef to match accessibility.rs and avoid clashing_extern_declarations
 
 extern "C" {
     fn CFArrayGetCount(arr: CFTypeRef) -> isize;
@@ -470,10 +448,10 @@ extern "C" {
 #[derive(Debug)]
 struct WindowInfo {
     pid:       i32,
-    window_id: u32,
     app_name:  String,
     layer:     i32,
     bounds:    (f64, f64, f64, f64),
+    window_id: u32, // CGWindowID — used to target exact window on correct monitor
 }
 
 fn window_at_point(x: f64, y: f64) -> Option<WindowInfo> {
@@ -509,13 +487,12 @@ fn window_at_point(x: f64, y: f64) -> Option<WindowInfo> {
             let pid = get_dict_int(dict_ptr, kCGWindowOwnerPID).unwrap_or(0) as i32;
             if pid == 0 { continue; }
 
+            let app_name  = get_dict_string(dict_ptr, kCGWindowOwnerName)
+                .unwrap_or_else(|| "Unknown".to_string());
             let window_id = get_dict_int(dict_ptr, kCGWindowNumber).unwrap_or(0) as u32;
 
-            let app_name = get_dict_string(dict_ptr, kCGWindowOwnerName)
-                .unwrap_or_else(|| "Unknown".to_string());
-
             CFRelease(list as CFTypeRef);
-            return Some(WindowInfo { pid, window_id, app_name, layer, bounds });
+            return Some(WindowInfo { pid, app_name, layer, bounds, window_id });
         }
 
         CFRelease(list as CFTypeRef);
