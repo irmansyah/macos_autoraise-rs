@@ -266,14 +266,25 @@ impl RaiserState {
             return;
         }
 
-        // 4. Ignore app list
+        // 4. Skip fullscreen windows — don't raise or draw border over fullscreen video/apps
+        if accessibility::is_window_fullscreen(win.pid) {
+            debug!("  → skip fullscreen pid={}", win.pid);
+            if cfg.show_border {
+                Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
+            }
+            self.raised_pid      = None;
+            self.last_window_pid = None;
+            return;
+        }
+
+        // 5. Ignore app list
         let app_lower = win.app_name.to_lowercase();
         if cfg.ignore_apps.iter().any(|a| a.to_lowercase() == app_lower) {
             debug!("  → ignored app '{}'", win.app_name);
             return;
         }
 
-        // 5. Ignore title list
+        // 6. Ignore title list
         if !cfg.ignore_titles.is_empty() {
             if let Some(title) = accessibility::get_window_title(win.pid) {
                 let tl = title.to_lowercase();
@@ -284,7 +295,7 @@ impl RaiserState {
             }
         }
 
-        // 6. AeroSpace awareness
+        // 7. AeroSpace awareness
         if let Some(ref as_state) = self.aerospace {
             if as_state.available {
                 if let Some(ax_id) = accessibility::get_ax_window_id(win.pid) {

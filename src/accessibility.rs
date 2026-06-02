@@ -42,8 +42,41 @@ pub fn is_trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
-/// Return the AXUIElement for an app by PID.
-/// Caller must CFRelease the returned element when done.
+const kAXFullscreenAttribute: &str = "AXFullScreen";
+
+/// Returns true if the frontmost window of the given PID is fullscreen.
+pub fn is_window_fullscreen(pid: i32) -> bool {
+    unsafe {
+        let app_elem = AXUIElementCreateApplication(pid as libc::pid_t);
+        if app_elem.is_null() { return false; }
+
+        let win = match get_focused_window(app_elem) {
+            Some(w) => w,
+            None => { CFRelease(app_elem as CFTypeRef); return false; }
+        };
+
+        let attr = CFString::new(kAXFullscreenAttribute);
+        let mut value: CFTypeRef = std::ptr::null_mut();
+        let err = AXUIElementCopyAttributeValue(
+            win,
+            attr.as_concrete_TypeRef(),
+            &mut value,
+        );
+
+        CFRelease(win as CFTypeRef);
+        CFRelease(app_elem as CFTypeRef);
+
+        if err == kAXErrorSuccess && !value.is_null() {
+            // value is a CFBoolean
+            let cf_bool = core_foundation::boolean::CFBoolean::wrap_under_get_rule(
+                value as *mut _
+            );
+            cf_bool.into()
+        } else {
+            false
+        }
+    }
+}
 pub fn ax_app_element(pid: i32) -> AXUIElementRef {
     unsafe { AXUIElementCreateApplication(pid as libc::pid_t) }
 }
