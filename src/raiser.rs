@@ -58,22 +58,15 @@ pub struct Raiser {
 }
 
 // ── Context-change notification ───────────────────────────────────────────────
-// We listen on a Unix domain socket at ~/.cache/autoraise-rs/notify.sock.
-// AeroSpace's exec-on-workspace-change fires:
-//   echo -n x | nc -U ~/.cache/autoraise-rs/notify.sock
-// CGDisplayRegisterReconfigurationCallback fires on monitor plug/unplug.
-// Both instantly call context_changed() → hide border + reset raise state.
 
 use std::sync::atomic::{AtomicBool, Ordering as AOrdering};
 
 static CONTEXT_CHANGED: AtomicBool = AtomicBool::new(false);
 
-/// Called from socket thread or CGDisplay callback — signals the raiser thread.
 fn signal_context_changed() {
     CONTEXT_CHANGED.store(true, AOrdering::Relaxed);
 }
 
-/// Spawn a thread that listens on the Unix socket for workspace-change signals.
 fn spawn_socket_listener() {
     use std::os::unix::net::UnixListener;
     use std::io::Read;
@@ -83,7 +76,7 @@ fn spawn_socket_listener() {
     let sock = dir.join("notify.sock");
 
     std::fs::create_dir_all(&dir).ok();
-    std::fs::remove_file(&sock).ok(); // remove stale socket from last run
+    std::fs::remove_file(&sock).ok();
 
     thread::spawn(move || {
         let listener = match UnixListener::bind(&sock) {
@@ -104,7 +97,6 @@ fn spawn_socket_listener() {
     });
 }
 
-/// Register a CGDisplay reconfiguration callback for monitor plug/unplug.
 fn register_display_callback() {
     extern "C" {
         fn CGDisplayRegisterReconfigurationCallback(
@@ -131,7 +123,6 @@ impl Raiser {
         let aerospace_aware  = cfg.aerospace_aware;
         drop(cfg);
 
-        // Start instant workspace/monitor change listeners
         spawn_socket_listener();
         register_display_callback();
 
@@ -146,16 +137,14 @@ impl Raiser {
                 poll_millis,
             );
             loop {
-                // Check for instant context-change signal first
                 if CONTEXT_CHANGED.swap(false, AOrdering::Relaxed) {
                     debug!("context changed — hiding border, resetting raise state");
-                    state.raised_pid      = None;
-                    state.last_window_pid = None;
+                    state.raised_window_id   = None;
+                    state.last_window_id     = None;
                     let cfg_c = state.config.lock().unwrap().clone();
                     if cfg_c.show_border {
                         Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
                     }
-                    // Also force AeroSpace floating list refresh
                     if let Some(ref mut s) = state.aerospace {
                         s.invalidate();
                     }
@@ -183,11 +172,13 @@ impl Raiser {
 struct RaiserState {
     config: Arc<Mutex<Config>>,
     aerospace: Option<AeroSpaceState>,
-    last_window_pid: Option<i32>,
+    /// CGWindowID of the window the mouse was over last tick
+    last_window_id: Option<u32>,
     still_ticks: u32,
     last_x: f64,
     last_y: f64,
-    raised_pid: Option<i32>,
+    /// CGWindowID of the last window we actually raised
+    raised_window_id: Option<u32>,
     aerospace_cycle_counter: u32,
     aerospace_refresh_cycles: u32,
 }
@@ -207,11 +198,11 @@ impl RaiserState {
         Self {
             config,
             aerospace,
-            last_window_pid: None,
+            last_window_id: None,
             still_ticks: 0,
             last_x: -9999.0,
             last_y: -9999.0,
-            raised_pid: None,
+            raised_window_id: None,
             aerospace_cycle_counter: 0,
             aerospace_refresh_cycles: aerospace_cycles,
         }
@@ -245,10 +236,9 @@ impl RaiserState {
             Some(w) => w,
             None => {
                 debug!("no window at ({x:.0},{y:.0})");
-                self.last_window_pid = None;
-                self.raised_pid = None;
+                self.last_window_id   = None;
+                self.raised_window_id = None;
                 self.still_ticks = 0;
-                // Hide border when mouse is over no window
                 if cfg.show_border {
                     Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
                 }
@@ -256,24 +246,22 @@ impl RaiserState {
             }
         };
 
-        debug!("at ({x:.0},{y:.0}): app='{}' pid={} layer={}", win.app_name, win.pid, win.layer);
+        debug!("at ({x:.0},{y:.0}): app='{}' pid={} wid={} layer={}", win.app_name, win.pid, win.window_id, win.layer);
 
-        // 3. Skip true system UI layers (menus=25, dock=20, screensaver=1000, etc.)
-        // Normal windows = 0, AeroSpace floating windows may be 0 or 3 (NSFloatingWindowLevel)
-        // We allow layers 0..=5 through; anything higher is system UI we don't touch.
+        // 3. Skip system UI layers
         if win.layer > 5 {
             debug!("  → skip system layer {}", win.layer);
             return;
         }
 
-        // 4. Skip fullscreen windows — don't raise or draw border over fullscreen video/apps
+        // 4. Skip fullscreen windows
         if accessibility::is_window_fullscreen(win.pid) {
             debug!("  → skip fullscreen pid={}", win.pid);
             if cfg.show_border {
                 Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
             }
-            self.raised_pid      = None;
-            self.last_window_pid = None;
+            self.raised_window_id = None;
+            self.last_window_id   = None;
             return;
         }
 
@@ -295,18 +283,18 @@ impl RaiserState {
             }
         }
 
-        // 7. AeroSpace awareness
+        // 7. AeroSpace awareness — keyed on window_id not pid
         if let Some(ref as_state) = self.aerospace {
             if as_state.available {
                 if let Some(ax_id) = accessibility::get_ax_window_id(win.pid) {
                     let is_floating = as_state.floating_window_ids.contains(&ax_id);
 
                     if is_floating {
-                        debug!("  → floating: no raise, draw border only (bounds={:?})", win.bounds);
+                        debug!("  → floating: no raise, draw border only");
                         pin_floating_on_top(win.pid);
 
-                        let new_float = self.last_window_pid != Some(win.pid);
-                        self.last_window_pid = Some(win.pid);
+                        let new_float = self.last_window_id != Some(win.window_id);
+                        self.last_window_id = Some(win.window_id);
 
                         if new_float && cfg.show_border {
                             let bounds = win.bounds;
@@ -322,27 +310,26 @@ impl RaiserState {
                         return;
                     }
 
-                    // Tiled window → fall through to raise logic below
                     debug!("  → tiled: will raise on hover");
                 }
             }
         }
 
-        // 7. Detect window change
-        let new_window = self.last_window_pid != Some(win.pid);
+        // 8. Detect window change — now by CGWindowID, so same-app different-window works
+        let new_window = self.last_window_id != Some(win.window_id);
         if new_window {
-            debug!("  → new window, resetting state");
-            self.still_ticks = 0;
-            self.raised_pid  = None;
+            debug!("  → new window wid={}, resetting state", win.window_id);
+            self.still_ticks      = 0;
+            self.raised_window_id = None;
         }
-        self.last_window_pid = Some(win.pid);
+        self.last_window_id = Some(win.window_id);
 
         if moved { self.still_ticks = 0; } else { self.still_ticks += 1; }
 
-        // 8. Already raised this window?
-        if self.raised_pid == Some(win.pid) { return; }
+        // 9. Already raised this exact window?
+        if self.raised_window_id == Some(win.window_id) { return; }
 
-        // 9. Delay gate
+        // 10. Delay gate
         let delay = cfg.delay;
         if delay == 0 { return; }
         if delay > 1 && cfg.require_mouse_stop && self.still_ticks < delay {
@@ -350,9 +337,9 @@ impl RaiserState {
             return;
         }
 
-        // 10. Raise
+        // 11. Raise
         debug!("  → RAISING '{}' pid={} wid={}", win.app_name, win.pid, win.window_id);
-        self.raised_pid = Some(win.pid);
+        self.raised_window_id = Some(win.window_id);
 
         let bounds      = win.bounds;
         let window_id   = win.window_id;
@@ -375,11 +362,7 @@ impl RaiserState {
     }
 }
 
-// ── Workspace / monitor helpers ───────────────────────────────────────────────
-
 // ── Pin floating window above tiled layer ─────────────────────────────────────
-// Sets NSWindowLevel to floating (3) so it always renders above normal (0) windows.
-// Called every time mouse enters a floating window — idempotent, cheap.
 
 fn pin_floating_on_top(pid: i32) {
     Queue::main().exec_async(move || {
@@ -393,7 +376,6 @@ fn pin_floating_on_top(pid: i32) {
             ];
             if app.is_null() { return; }
 
-            // Get all windows for this app via AX and set their level
             let ax_app = crate::accessibility::ax_app_element(pid);
             if ax_app.is_null() { return; }
 
@@ -426,11 +408,8 @@ fn raise_on_main_thread(
 }
 
 unsafe fn do_raise(pid: i32, window_id: u32) {
-    // Raise the EXACT window by CGWindowID — prevents pulling windows from other spaces
     accessibility::raise_app_window(pid, Some(window_id));
 
-    // NSApplicationActivateAllWindows (1) = only activate windows on CURRENT space
-    // Does NOT switch spaces or pull windows from other monitors
     let cls = match Class::get("NSRunningApplication") {
         Some(c) => c,
         None    => return,
@@ -444,7 +423,6 @@ unsafe fn do_raise(pid: i32, window_id: u32) {
 }
 
 // ── CoreFoundation Raw FFI ────────────────────────────────────────────────────
-// CFArray uses CFTypeRef to match accessibility.rs and avoid clashing_extern_declarations
 
 extern "C" {
     fn CFArrayGetCount(arr: CFTypeRef) -> isize;
@@ -462,7 +440,7 @@ struct WindowInfo {
     app_name:  String,
     layer:     i32,
     bounds:    (f64, f64, f64, f64),
-    window_id: u32, // CGWindowID — used to target exact window on correct monitor
+    window_id: u32,
 }
 
 fn window_at_point(x: f64, y: f64) -> Option<WindowInfo> {
