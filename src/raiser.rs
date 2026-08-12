@@ -310,6 +310,19 @@ impl RaiserState {
                         return;
                     }
 
+                    // Tiled window: only raise if it lives on the currently
+                    // focused AeroSpace workspace. A tiled window visible on
+                    // a non-focused workspace (e.g. a second monitor showing
+                    // an inactive workspace) should not steal focus.
+                    if !as_state.window_matches_current_workspace(ax_id) {
+                        debug!("  → tiled: window on non-focused workspace — skip raise");
+                        self.last_window_id = Some(win.window_id);
+                        if cfg.show_border {
+                            Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
+                        }
+                        return;
+                    }
+
                     debug!("  → tiled: will raise on hover");
                 }
             }
