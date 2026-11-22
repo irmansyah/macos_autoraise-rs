@@ -46,7 +46,7 @@ pkgs.rustPlatform.buildRustPackage rec {
 
   meta = with lib; {
     description = "Focus-follows-mouse & auto-raise for macOS — AeroSpace-aware, written in Rust";
-    homepage    = "https://github.com/you/autoraise-rs";
+    homepage    = "https://github.com/irmansyah/autoraise-rs";
     license     = licenses.mit;
     platforms   = platforms.darwin;
     mainProgram = "autoraise-rs";
