@@ -1,4 +1,4 @@
-// config.rs — Configuration loading from ~/.config/autoraise-rs/config.toml
+// src/config.rs
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -41,6 +41,11 @@ pub struct Config {
     /// Border color as hex string e.g. "#FF3366"
     #[serde(default = "default_border_color")]
     pub border_color: String,
+    
+    /// Shell command run when focus moves to a different app.
+    /// Placeholders: {app_id} {app_name}. Env: AUTORAISE_APP_ID etc.
+    #[serde(default)]
+    pub on_focus_command: Option<String>,
 }
 
 fn default_poll_millis() -> u64 { 50 }
@@ -65,52 +70,71 @@ impl Default for Config {
             show_border: true,
             border_width: default_border_width(),
             border_color: default_border_color(),
+            on_focus_command: None,
         }
     }
 }
 
 impl Config {
     pub fn load_or_default() -> Self {
-        let path = match config_path() {
-            Some(p) => p,
-            None => {
-                eprintln!("[config] Could not determine config directory");
-                return Config::default();
+        // Dev build (`cargo run`): prefer <project>/dev_config.toml
+        if cfg!(debug_assertions) {
+            let dev = dev_config_path();
+            eprintln!("[config] dev build — looking for {}", dev.display());
+            if dev.exists() {
+                return Self::load_toml(&dev);
             }
-        };
-
-        eprintln!("[config] Looking for config at: {}", path.display());
-
-        if !path.exists() {
-            eprintln!("[config] File not found — using defaults");
-            return Config::default();
+            eprintln!("[config] dev_config.toml not found — falling back to ~/.config");
         }
 
-        match fs::read_to_string(&path) {
-            Ok(content) => {
-                eprintln!("[config] File found, parsing...");
-                match toml::from_str::<Config>(&content) {
-                    Ok(cfg) => {
-                        eprintln!("[config] Loaded OK — poll_millis={} delay={} aerospace_aware={}",
-                            cfg.poll_millis, cfg.delay, cfg.aerospace_aware);
-                        cfg
-                    }
-                    Err(e) => {
-                        eprintln!("[config] Parse error: {e}");
-                        Config::default()
-                    }
+        match config_path() {
+            Some(path) => {
+                eprintln!("[config] Looking for config at: {}", path.display());
+                if path.exists() {
+                    Self::load_toml(&path)
+                } else {
+                    eprintln!("[config] File not found — using defaults");
+                    Config::default()
                 }
             }
-            Err(e) => {
-                eprintln!("[config] Read error: {e}");
+            None => {
+                eprintln!("[config] Could not determine config directory");
                 Config::default()
             }
         }
     }
 
+    fn load_toml(path: &std::path::Path) -> Self {
+        match fs::read_to_string(path) {
+            Ok(content) => match toml::from_str::<Config>(&content) {
+                Ok(cfg) => {
+                    eprintln!(
+                        "[config] Loaded {} OK — poll_millis={} delay={} aerospace_aware={}",
+                        path.display(), cfg.poll_millis, cfg.delay, cfg.aerospace_aware
+                    );
+                    cfg
+                }
+                Err(e) => {
+                    eprintln!("[config] Parse error in {}: {e}", path.display());
+                    Config::default()
+                }
+            },
+            Err(e) => {
+                eprintln!("[config] Read error for {}: {e}", path.display());
+                Config::default()
+            }
+        }
+    }
+}
+
+/// <project root>/dev_config.toml. The path is baked in at compile time,
+/// so it works no matter which directory you run `cargo run` from.
+fn dev_config_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("dev_config.toml")
 }
 
 fn config_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".config").join("autoraise-rs").join("config.toml"))
 }
+

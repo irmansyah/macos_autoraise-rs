@@ -1,3 +1,4 @@
+// src/main.rs
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
 
 mod accessibility;
@@ -5,6 +6,7 @@ mod aerospace;
 mod border;
 mod config;
 mod event_tap;
+mod hooks;
 mod raiser;
 
 use std::sync::{Arc, Mutex};
@@ -52,6 +54,10 @@ struct Cli {
     /// Verbose logging
     #[arg(long, default_value_t = false)]
     verbose: bool,
+    
+    /// Shell command to run when a different app gets focus ({app_id}, {app_name})
+    #[arg(long)]
+    on_focus_command: Option<String>,
 }
 
 fn main() {
@@ -90,6 +96,7 @@ fn main() {
             .collect();
         cfg.ignore_titles.extend(extra);
     }
+    if let Some(v) = cli.on_focus_command { cfg.on_focus_command = Some(v); }
 
     info!("autoraise-rs starting");
     info!("  poll_millis:         {}ms",  cfg.poll_millis);

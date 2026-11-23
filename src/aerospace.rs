@@ -1,4 +1,4 @@
-// aerospace.rs — AeroSpace tiling WM integration
+// src/aerospace.rs — AeroSpace tiling WM integration
 //
 // AeroSpace exposes a CLI: `aerospace list-windows --all`
 // with --format '%{window-id} %{parent-container-layout} %{app-name} %{window-title}'

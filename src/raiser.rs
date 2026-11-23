@@ -359,7 +359,10 @@ impl RaiserState {
         let show_border = cfg.show_border;
         let bwidth      = cfg.border_width;
         let bcolor      = cfg.border_color.clone();
-        raise_on_main_thread(win.pid, window_id, bounds, show_border, bwidth, bcolor);
+        raise_on_main_thread(
+            win.pid, window_id, win.app_name.clone(), bounds,
+            show_border, bwidth, bcolor, cfg.on_focus_command.clone(),
+        );
     }
 
     fn modifier_key_held(&self, key: &str) -> bool {
@@ -402,37 +405,48 @@ fn pin_floating_on_top(pid: i32) {
 fn raise_on_main_thread(
     pid: i32,
     window_id: u32,
+    app_name: String,
     bounds: (f64, f64, f64, f64),
     show_border: bool,
     border_width: f64,
     border_color: String,
+    on_focus_command: Option<String>,
 ) {
     Queue::main().exec_async(move || {
         unsafe {
-            do_raise(pid, window_id);
+            let app_id = do_raise(pid, window_id);
             if show_border {
                 crate::border::update_border(
                     bounds.0, bounds.1, bounds.2, bounds.3,
                     border_width, &border_color,
                 );
             }
+            if let (Some(cmd), Some(app_id)) = (on_focus_command, app_id) {
+                crate::hooks::on_focus(&cmd, &crate::hooks::FocusInfo {
+                    app_id, app_name, pid, window_id,
+                });
+            }
         }
     });
 }
 
-unsafe fn do_raise(pid: i32, window_id: u32) {
+/// Raises the window, activates the app, returns the app's bundle id.
+unsafe fn do_raise(pid: i32, window_id: u32) -> Option<String> {
     accessibility::raise_app_window(pid, Some(window_id));
 
-    let cls = match Class::get("NSRunningApplication") {
-        Some(c) => c,
-        None    => return,
-    };
+    let cls = Class::get("NSRunningApplication")?;
     let app: *mut Object = msg_send![cls,
         runningApplicationWithProcessIdentifier: pid as i32
     ];
-    if !app.is_null() {
-        let _: bool = msg_send![app, activateWithOptions: 1u64];
-    }
+    if app.is_null() { return None; }
+
+    let _: bool = msg_send![app, activateWithOptions: 1u64];
+
+    let ns: *mut Object = msg_send![app, bundleIdentifier];
+    if ns.is_null() { return None; } // some helper processes have no bundle id
+    let c: *const std::os::raw::c_char = msg_send![ns, UTF8String];
+    if c.is_null() { return None; }
+    Some(std::ffi::CStr::from_ptr(c).to_string_lossy().into_owned())
 }
 
 // ── CoreFoundation Raw FFI ────────────────────────────────────────────────────
