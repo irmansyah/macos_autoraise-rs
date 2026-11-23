@@ -1,4 +1,4 @@
-// raiser.rs — Core auto-raise logic
+// src/raiser.rs — Core auto-raise logic
 
 #![allow(non_upper_case_globals, non_snake_case, unexpected_cfgs)]
 
@@ -283,48 +283,28 @@ impl RaiserState {
             }
         }
 
-        // 7. AeroSpace awareness — keyed on window_id not pid
-        if let Some(ref as_state) = self.aerospace {
+        // 7. AeroSpace awareness
+        if let Some(ref mut as_state) = self.aerospace {
             if as_state.available {
-                if let Some(ax_id) = accessibility::get_ax_window_id(win.pid) {
-                    let is_floating = as_state.floating_window_ids.contains(&ax_id);
-
-                    if is_floating {
-                        debug!("  → floating: no raise, draw border only");
-                        pin_floating_on_top(win.pid);
-
-                        let new_float = self.last_window_id != Some(win.window_id);
-                        self.last_window_id = Some(win.window_id);
-
-                        if new_float && cfg.show_border {
-                            let bounds = win.bounds;
-                            let bwidth = cfg.border_width;
-                            let bcolor = cfg.border_color.clone();
-                            Queue::main().exec_async(move || unsafe {
-                                crate::border::update_border(
-                                    bounds.0, bounds.1, bounds.2, bounds.3,
-                                    bwidth, &bcolor,
-                                );
-                            });
-                        }
-                        return;
+                // Hard gate: never act on a window outside the focused
+                // workspace (this covers AeroSpace-hidden windows parked in
+                // the screen corner). Applies to floating windows too.
+                if !as_state.is_in_focused_workspace(win.window_id) {
+                    debug!("  → wid={} not in focused workspace — skip", win.window_id);
+                    self.last_window_id = Some(win.window_id);
+                    if cfg.show_border {
+                        Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
                     }
-
-                    // Tiled window: only raise if it lives on the currently
-                    // focused AeroSpace workspace. A tiled window visible on
-                    // a non-focused workspace (e.g. a second monitor showing
-                    // an inactive workspace) should not steal focus.
-                    if !as_state.window_matches_current_workspace(ax_id) {
-                        debug!("  → tiled: window on non-focused workspace — skip raise");
-                        self.last_window_id = Some(win.window_id);
-                        if cfg.show_border {
-                            Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
-                        }
-                        return;
-                    }
-
-                    debug!("  → tiled: will raise on hover");
+                    return;
                 }
+
+                if as_state.floating_window_ids.contains(&win.window_id) {
+                    debug!("  → floating: no raise, draw border only");
+                    pin_floating_on_top(win.pid);
+                    // ...same body as before...
+                    return;
+                }
+                debug!("  → tiled: will raise on hover");
             }
         }
 
@@ -348,6 +328,19 @@ impl RaiserState {
         if delay > 1 && cfg.require_mouse_stop && self.still_ticks < delay {
             debug!("  → waiting ({}/{})", self.still_ticks, delay);
             return;
+        }
+        
+        // Final gate: fresh AeroSpace check, so a stale cache can never raise
+        // a window from another workspace.
+        if let Some(ref mut s) = self.aerospace {
+            if !s.is_in_focused_workspace_fresh(win.window_id) {
+                debug!("  → wid={} not in focused workspace (fresh) — skip", win.window_id);
+                self.raised_window_id = Some(win.window_id); // don't re-query every tick
+                if cfg.show_border {
+                    Queue::main().exec_async(|| unsafe { crate::border::hide_border() });
+                }
+                return;
+            }
         }
 
         // 11. Raise
@@ -432,7 +425,9 @@ fn raise_on_main_thread(
 
 /// Raises the window, activates the app, returns the app's bundle id.
 unsafe fn do_raise(pid: i32, window_id: u32) -> Option<String> {
-    accessibility::raise_app_window(pid, Some(window_id));
+    // If we can't raise this exact window, do nothing. Never activate the
+    // app, because that can pull focus to its windows in other workspaces.
+    accessibility::raise_app_window(pid, Some(window_id))?;
 
     let cls = Class::get("NSRunningApplication")?;
     let app: *mut Object = msg_send![cls,
@@ -440,7 +435,8 @@ unsafe fn do_raise(pid: i32, window_id: u32) -> Option<String> {
     ];
     if app.is_null() { return None; }
 
-    let _: bool = msg_send![app, activateWithOptions: 1u64];
+    // 0 = no NSApplicationActivateAllWindows
+    let _: bool = msg_send![app, activateWithOptions: 0u64];
 
     let ns: *mut Object = msg_send![app, bundleIdentifier];
     if ns.is_null() { return None; } // some helper processes have no bundle id

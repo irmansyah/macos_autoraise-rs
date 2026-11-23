@@ -1,4 +1,4 @@
-// event_tap.rs — CGEventTap + run loop
+// src/event_tap.rs — CGEventTap + run loop
 
 use std::sync::mpsc;
 use log::debug;

@@ -1,4 +1,4 @@
-// border.rs — Border overlay using CGS private API
+// src/border.rs — Border overlay using CGS private API
 //
 // Instead of a persistent NSWindow (which bleeds across spaces/fullscreen),
 // we use a per-draw CGS window that is created, drawn, and destroyed each time.

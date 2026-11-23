@@ -1,4 +1,4 @@
-// accessibility.rs — macOS Accessibility API wrappers
+// src/accessibility.rs — macOS Accessibility API wrappers
 
 use core_foundation::base::{CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
@@ -35,6 +35,7 @@ const kAXRaiseAction: &str            = "AXRaise";
 const kAXMainAttribute: &str          = "AXMain";
 const kAXTitleAttribute: &str         = "AXTitle";
 const kAXErrorSuccess: i32 = 0;
+const kAXFocusedAttribute: &str = "AXFocused";
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -152,8 +153,19 @@ pub fn raise_app_window(pid: i32, window_ax_id_hint: Option<u32>) -> Option<u32>
             let raise_err = AXUIElementPerformAction(win, raise_action.as_concrete_TypeRef());
             if raise_err == kAXErrorSuccess {
                 debug!("AXRaise succeeded for pid={pid} wid={wid}");
+                // Make THIS window the app's main/focused window, so the app
+                // doesn't fall back to a window in another workspace.
+                let cf_true = core_foundation::boolean::CFBoolean::true_value();
+                for attr in [kAXMainAttribute, kAXFocusedAttribute] {
+                    let a = CFString::new(attr);
+                    AXUIElementSetAttributeValue(
+                        win,
+                        a.as_concrete_TypeRef(),
+                        cf_true.as_CFTypeRef(),
+                    );
+                }
                 raised_wid = Some(wid);
-                break; // Found and raised the right window
+                break;
             }
         }
 
@@ -235,30 +247,6 @@ pub fn get_window_title(pid: i32) -> Option<String> {
         } else {
             None
         }
-    }
-}
-
-/// Get the raw CGWindowID for the frontmost window of a PID.
-pub fn get_ax_window_id(pid: i32) -> Option<u32> {
-    unsafe {
-        let app_elem = AXUIElementCreateApplication(pid as libc::pid_t);
-        if app_elem.is_null() { return None; }
-
-        let win = match get_focused_window(app_elem) {
-            Some(w) => w,
-            None => {
-                CFRelease(app_elem as CFTypeRef);
-                return None;
-            }
-        };
-
-        let mut wid: u32 = 0;
-        _AXUIElementGetWindow(win, &mut wid);
-
-        CFRelease(win as CFTypeRef);
-        CFRelease(app_elem as CFTypeRef);
-
-        if wid != 0 { Some(wid) } else { None }
     }
 }
 

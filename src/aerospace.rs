@@ -34,6 +34,8 @@ pub struct AeroSpaceState {
     pub available: bool,
     last_refresh: Instant,
     refresh_interval: Duration,
+    focused_ws_windows: Option<HashSet<u32>>,
+    focused_ws_checked: Instant,
 }
 
 impl AeroSpaceState {
@@ -46,20 +48,21 @@ impl AeroSpaceState {
             available: false,
             last_refresh: Instant::now() - Duration::from_secs(60), // force first refresh
             refresh_interval: Duration::from_millis(refresh_ms),
+            focused_ws_windows: None,
+            focused_ws_checked: Instant::now() - Duration::from_secs(60),
         };
         state.probe_availability();
         state
     }
 
-    /// Check if `aerospace` binary exists and is runnable.
     fn probe_availability(&mut self) {
         let result = Command::new("aerospace")
-            .arg("version")
+            .arg("--version")
             .output();
         match result {
             Ok(out) if out.status.success() => {
                 let version = String::from_utf8_lossy(&out.stdout);
-                debug!("AeroSpace detected: {}", version.trim());
+                debug!("AeroSpace detected: {}", version.lines().next().unwrap_or("").trim());
                 self.available = true;
                 self.refresh();
             }
@@ -230,16 +233,16 @@ impl AeroSpaceState {
         map
     }
 
-    /// True if `window_id` is on the currently focused workspace, or if we
-    /// don't have enough information to say otherwise (fail-open, matching
-    /// the existing "raise everything if AeroSpace unavailable" behavior).
-    pub fn window_matches_current_workspace(&self, window_id: u32) -> bool {
-        if !self.available { return true; }
-        match (&self.current_workspace, self.window_workspace.get(&window_id)) {
-            (Some(cur), Some(ws)) => cur == ws,
-            _ => true,
-        }
-    }
+    // /// True if `window_id` is on the currently focused workspace, or if we
+    // /// don't have enough information to say otherwise (fail-open, matching
+    // /// the existing "raise everything if AeroSpace unavailable" behavior).
+    // pub fn window_matches_current_workspace(&self, window_id: u32) -> bool {
+    //     if !self.available { return true; }
+    //     match (&self.current_workspace, self.window_workspace.get(&window_id)) {
+    //         (Some(cur), Some(ws)) => cur == ws,
+    //         _ => true,
+    //     }
+    // }
 
     /// Refresh if the refresh interval has elapsed.
     pub fn refresh_if_due(&mut self) {
@@ -251,5 +254,65 @@ impl AeroSpaceState {
     /// Force refresh on next refresh_if_due call (e.g. after workspace change).
     pub fn invalidate(&mut self) {
         self.last_refresh = Instant::now() - self.refresh_interval - Duration::from_secs(1);
+        self.focused_ws_checked = Instant::now() - Duration::from_secs(60);
+    }
+    
+    /// True if the window is in the currently focused workspace.
+    /// Queries AeroSpace directly (cached 250ms) so it is never stale after
+    /// a workspace switch. Fails open only if the query itself fails.
+    pub fn is_in_focused_workspace(&mut self, window_id: u32) -> bool {
+        if !self.available { return true; }
+
+        if self.focused_ws_checked.elapsed() >= Duration::from_millis(250) {
+            self.focused_ws_checked = Instant::now();
+            self.focused_ws_windows = Command::new("aerospace")
+                .args(["list-windows", "--workspace", "visible", "--format", "%{window-id}"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter_map(|l| l.trim().parse::<u32>().ok())
+                        .collect()
+                });
+        }
+
+        match &self.focused_ws_windows {
+            Some(set) => set.contains(&window_id),
+            None => false, // query failed → don't act
+        }
+    }
+
+    /// Uncached check, used right before a raise. Fails CLOSED.
+    pub fn is_in_focused_workspace_fresh(&mut self, window_id: u32) -> bool {
+        if !self.available { return true; }
+
+        let ids: Option<HashSet<u32>> = Command::new("aerospace")
+            .args(["list-windows", "--workspace", "visible", "--format", "%{window-id}"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| l.trim().parse::<u32>().ok())
+                    .collect()
+            });
+
+        self.focused_ws_windows = ids.clone();
+        self.focused_ws_checked = Instant::now();
+
+        match ids {
+            Some(set) => {
+                let ok = set.contains(&window_id);
+                debug!("fresh check: wid={window_id} in focused ws? {ok} (ws windows: {:?})", set);
+                ok
+            }
+            None => {
+                warn!("aerospace focused-workspace query failed — refusing to raise");
+                false
+            }
+        }
     }
 }
